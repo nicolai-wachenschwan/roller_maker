@@ -6,8 +6,14 @@ from stpyvista import stpyvista
 from scipy.spatial import Delaunay
 from shapely.geometry import Polygon, Point
 import io
-import trimesh # Important: trimesh is now the primary library
+import trimesh
+from stpyvista.utils import start_xvfb
 
+
+try:
+    start_xvfb()
+except Exception as e:
+    print("unable to start xvfb, when you run local this is fine!")#st.warning(f"(this is ok for local runs) Could not start virtual framebuffer: {e}")    
 # Initialize session state to store the mesh
 if 'mesh' not in st.session_state:
     st.session_state.mesh = None
