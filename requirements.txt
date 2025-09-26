@@ -7,4 +7,5 @@ scipy
 shapely
 trimesh
 manifold3d
+vtk
 networkx
