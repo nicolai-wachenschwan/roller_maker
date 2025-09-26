@@ -1,0 +1,10 @@
+streamlit 
+numpy 
+Pillow 
+pyvista <=0.45
+stpyvista 
+scipy 
+shapely
+trimesh
+manifold3d
+networkx
