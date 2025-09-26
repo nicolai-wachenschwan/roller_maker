@@ -1,6 +1,6 @@
 import streamlit as st
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps, ImageFilter
 import pyvista as pv
 from stpyvista import stpyvista
 from scipy.spatial import Delaunay
@@ -18,6 +18,30 @@ if 'cutter_mesh' not in st.session_state:
 
 if 'output_filename' not in st.session_state:
     st.session_state.output_filename = None
+
+# --- Additions for Image Editing ---
+if 'original_image' not in st.session_state:
+    st.session_state.original_image = None
+
+if 'edited_image' not in st.session_state:
+    st.session_state.edited_image = None
+
+if 'image_history' not in st.session_state:
+    st.session_state.image_history = []
+
+if 'history_index' not in st.session_state:
+    st.session_state.history_index = -1
+
+# --- Image Editing Functions ---
+def add_to_history(new_image):
+    """Adds a new image to the history stack."""
+    # If we are not at the end of the history, truncate it
+    if st.session_state.history_index < len(st.session_state.image_history) - 1:
+        st.session_state.image_history = st.session_state.image_history[:st.session_state.history_index + 1]
+
+    st.session_state.image_history.append(new_image)
+    st.session_state.history_index += 1
+    st.session_state.edited_image = new_image
 
 # --- CORE LOGIC FUNCTIONS (switched to trimesh) ---
 
@@ -286,11 +310,58 @@ with col1:
     uploaded_file = st.file_uploader("Upload Image", type=["png", "jpg", "jpeg", "bmp"])
     
     if uploaded_file:
-        # Show original image
-        st.image(uploaded_file, caption="Uploaded Image", use_container_width=True)
+        # Initialize editing state when a new image is uploaded
+        if st.session_state.original_image is None or st.session_state.original_image.tobytes() != uploaded_file.getvalue():
+            st.session_state.original_image = Image.open(uploaded_file)
+            st.session_state.image_history = [st.session_state.original_image]
+            st.session_state.history_index = 0
+            st.session_state.edited_image = st.session_state.original_image
+
+        # --- IMAGE EDITING UI ---
+        st.subheader("🎨 Image Editing")
         
+        # Display the current state of the image
+        st.image(st.session_state.edited_image, caption="Editable Image", use_container_width=True)
+
+        # Undo/Redo buttons
+        col_undo_redo1, col_undo_redo2 = st.columns(2)
+        with col_undo_redo1:
+            if st.button("Undo", use_container_width=True, disabled=st.session_state.history_index <= 0):
+                st.session_state.history_index -= 1
+                st.session_state.edited_image = st.session_state.image_history[st.session_state.history_index]
+        with col_undo_redo2:
+            if st.button("Redo", use_container_width=True, disabled=st.session_state.history_index >= len(st.session_state.image_history) - 1):
+                st.session_state.history_index += 1
+                st.session_state.edited_image = st.session_state.image_history[st.session_state.history_index]
+
+        # Basic editing tools
+        st.markdown("---")
+        if st.button("Invert Colors", use_container_width=True):
+            inverted_image = ImageOps.invert(st.session_state.edited_image.convert('L'))
+            add_to_history(inverted_image)
+
+        # Threshold
+        st.markdown("---")
+        col_thresh1, col_thresh2 = st.columns([2,1])
+        with col_thresh1:
+            threshold_value = st.slider("Threshold", 0, 255, 128)
+        with col_thresh2:
+            if st.button("Apply Threshold", use_container_width=True):
+                thresholded_image = st.session_state.edited_image.convert('L').point(lambda p: 255 if p > threshold_value else 0, '1')
+                add_to_history(thresholded_image)
+
+        # Gaussian Blur
+        st.markdown("---")
+        col_blur1, col_blur2 = st.columns([2,1])
+        with col_blur1:
+            blur_radius = st.slider("Gaussian Blur Radius", 0, 10, 2)
+        with col_blur2:
+            if st.button("Apply Blur", use_container_width=True):
+                blurred_image = st.session_state.edited_image.convert('L').filter(ImageFilter.GaussianBlur(radius=blur_radius))
+                add_to_history(blurred_image)
+
         # Show image info and DPI calculations
-        temp_img = Image.open(uploaded_file)
+        temp_img = st.session_state.edited_image
         resized_img, actual_dpi, physical_dims = resize_image_for_dpi(temp_img, radius, dpi, allow_upscaling)
         
         # Display comprehensive image information
@@ -334,15 +405,20 @@ with col1:
             
             try:
                 progress_bar.progress(10)
+                # Convert the edited PIL image to an in-memory file for processing
+                image_buffer = io.BytesIO()
+                st.session_state.edited_image.save(image_buffer, format="PNG")
+                image_buffer.seek(0)
+
                 # Calculate the mesh and save it as a trimesh object
                 if create_axis_hole:
                     st.session_state.mesh = create_cylinder_mesh(
-                        uploaded_file, radius, displacement, dpi, allow_upscaling, 
+                        image_buffer, radius, displacement, dpi, allow_upscaling,
                         create_axis_hole, axis_diameter
                     )
                 else:
                     st.session_state.mesh = create_cylinder_mesh(
-                        uploaded_file, radius, displacement, dpi, allow_upscaling
+                        image_buffer, radius, displacement, dpi, allow_upscaling
                     )
                 
                 progress_bar.progress(100)
