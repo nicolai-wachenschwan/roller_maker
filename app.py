@@ -317,7 +317,7 @@ with col1:
     
     if uploaded_file:
         # Initialize editing state when a new image is uploaded
-        if st.session_state.original_image is None or st.session_state.original_image.tobytes() != uploaded_file.getvalue():
+        if st.session_state.original_image is None:
             st.session_state.original_image = Image.open(uploaded_file)
             st.session_state.image_history = [st.session_state.original_image]
             st.session_state.history_index = 0
@@ -345,6 +345,7 @@ with col1:
         if st.button("Invert Colors", use_container_width=True):
             inverted_image = ImageOps.invert(st.session_state.edited_image.convert('L'))
             add_to_history(inverted_image)
+            st.rerun()
 
         # Threshold
         st.markdown("---")
