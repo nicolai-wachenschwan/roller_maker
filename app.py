@@ -38,6 +38,12 @@ if 'image_history' not in st.session_state:
 if 'history_index' not in st.session_state:
     st.session_state.history_index = -1
 
+# --- Additions for Radius/Width Sync ---
+if 'radius' not in st.session_state:
+    st.session_state.radius = 30.0
+if 'width' not in st.session_state:
+    st.session_state.width = 30.0 * 2 * np.pi
+
 # --- Image Editing Functions ---
 def add_to_history(new_image):
     """Adds a new image to the history stack."""
@@ -48,6 +54,11 @@ def add_to_history(new_image):
     st.session_state.image_history.append(new_image)
     st.session_state.history_index += 1
     st.session_state.edited_image = new_image
+
+# --- Callbacks for Radius/Width Sync ---
+def sync_radius_from_width():
+    """Callback to update radius when width changes."""
+    st.session_state.radius = st.session_state.width / (2 * np.pi)
 
 # --- CORE LOGIC FUNCTIONS (switched to trimesh) ---
 
@@ -292,7 +303,23 @@ st.markdown("This tool creates a 3D printable 'Lithophane-Roller' from an image.
 # -- SETTINGS IN THE SIDEBAR --
 with st.sidebar:
     st.header("⚙️ Settings")
-    radius = st.slider("Base Radius (in mm)", 10.0, 100.0, 30.0, 0.5)
+    st.number_input(
+        "Breite (Umfang in mm)",
+        key='width',
+        on_change=sync_radius_from_width,
+        step=1.0,
+        format="%.2f",
+        help="Geben Sie die gewünschte Breite (Umfang) des Zylinders an. Der Radius wird automatisch angepasst."
+    )
+
+    st.slider(
+        "Base Radius (in mm)",
+        10.0,
+        100.0,
+        key='radius',
+        step=0.5
+    )
+    radius = st.session_state.radius
     displacement = st.slider("Radial Displacement (Wall Thickness in mm)", 0.5, 10.0, 2.0, 0.1)
     dpi = st.slider("DPI (Resolution)", 50, 300, 150, 10,
                    help="Resolution based on physical cylinder dimensions")
