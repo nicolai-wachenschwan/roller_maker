@@ -60,6 +60,62 @@ def sync_radius_from_width():
     """Callback to update radius when width changes."""
     st.session_state.radius = st.session_state.width / (2 * np.pi)
 
+def correct_overhangs(image, angle_deg, radius, displacement, dpi, allow_upscaling,
+                      l_to_r=True, r_to_l=True, t_to_b=True, b_to_t=True):
+    """
+    Adjusts image brightness to prevent overhangs steeper than a given angle
+    by raising the brightness of lower pixels.
+    """
+    # 1. Get Physical Dimensions and final resolution
+    resized_image, _, physical_dims = resize_image_for_dpi(
+        image, radius, dpi, allow_upscaling
+    )
+    cylinder_height_mm, circumference_mm = physical_dims
+    final_width_px, final_height_px = resized_image.size
+
+    # 2. Calculate Maximum Allowed Brightness Change for each direction
+    max_slope = np.tan(np.deg2rad(angle_deg))
+
+    # Horizontal (Left/Right) correction corresponds to the cylinder's main axis
+    pixel_width_mm = cylinder_height_mm / final_width_px
+    max_delta_brightness_lr = (max_slope * pixel_width_mm * 255) / displacement
+
+    # Vertical (Top/Bottom) correction corresponds to the cylinder's circumference
+    pixel_height_mm = circumference_mm / final_height_px
+    max_delta_brightness_tb = (max_slope * pixel_height_mm * 255) / displacement
+
+    # 3. Apply Correction Algorithm
+    img_array = np.array(resized_image.convert("L")).astype(np.float32)
+
+    # The core logic is to ensure that for any two adjacent pixels,
+    # their brightness difference does not violate the maximum slope.
+    # We raise the lower pixel's brightness to meet this requirement.
+    # Formula: pixel_B_new = max(pixel_B_old, pixel_A - max_delta_brightness)
+
+    if l_to_r:
+        for i in range(1, final_width_px):
+            prev_col = img_array[:, i - 1]
+            img_array[:, i] = np.maximum(img_array[:, i], prev_col - max_delta_brightness_lr)
+
+    if r_to_l:
+        for i in range(final_width_px - 2, -1, -1):
+            next_col = img_array[:, i + 1]
+            img_array[:, i] = np.maximum(img_array[:, i], next_col - max_delta_brightness_lr)
+
+    if t_to_b:
+        for j in range(1, final_height_px):
+            prev_row = img_array[j - 1, :]
+            img_array[j, :] = np.maximum(img_array[j, :], prev_row - max_delta_brightness_tb)
+
+    if b_to_t:
+        for j in range(final_height_px - 2, -1, -1):
+            next_row = img_array[j + 1, :]
+            img_array[j, :] = np.maximum(img_array[j, :], next_row - max_delta_brightness_tb)
+
+    # 4. Return Corrected Image
+    corrected_image_array = np.clip(img_array, 0, 255).astype(np.uint8)
+    return Image.fromarray(corrected_image_array)
+
 # --- CORE LOGIC FUNCTIONS (switched to trimesh) ---
 
 def resize_image_for_dpi(image, radius, target_dpi, allow_upscaling=False):
@@ -393,6 +449,42 @@ with col1:
             if st.button("Apply Blur", use_container_width=True):
                 blurred_image = st.session_state.edited_image.convert('L').filter(ImageFilter.GaussianBlur(radius=blur_radius))
                 add_to_history(blurred_image)
+
+        # Overhang Correction
+        st.markdown("---")
+        st.subheader("Overhang Correction")
+        overhang_angle = st.slider(
+            "Max Overhang Angle (°)", 1, 90, 45,
+            help="Corrects steep slopes that would create unprintable overhangs. 90° is vertical (no correction), 45° is a standard recommendation."
+        )
+
+        st.write("Correction Directions:")
+        col_dir1, col_dir2, col_dir3, col_dir4 = st.columns(4)
+        with col_dir1:
+            correct_l_to_r = st.checkbox("L→R", value=True, help="Left to Right")
+        with col_dir2:
+            correct_r_to_l = st.checkbox("R→L", value=True, help="Right to Left")
+        with col_dir3:
+            correct_t_to_b = st.checkbox("T→B", value=True, help="Top to Bottom")
+        with col_dir4:
+            correct_b_to_t = st.checkbox("B→T", value=True, help="Bottom to Top")
+
+        if st.button("Apply Overhang Correction", use_container_width=True):
+            with st.spinner("Applying overhang correction..."):
+                corrected_image = correct_overhangs(
+                    image=st.session_state.edited_image,
+                    angle_deg=overhang_angle,
+                    radius=radius,
+                    displacement=displacement,
+                    dpi=dpi,
+                    allow_upscaling=allow_upscaling,
+                    l_to_r=correct_l_to_r,
+                    r_to_l=correct_r_to_l,
+                    t_to_b=correct_t_to_b,
+                    b_to_t=correct_b_to_t
+                )
+                add_to_history(corrected_image)
+                st.rerun()
 
         # Show image info and DPI calculations
         temp_img = st.session_state.edited_image
