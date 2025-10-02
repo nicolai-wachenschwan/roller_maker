@@ -58,7 +58,10 @@ def add_to_history(new_image):
 # --- Callbacks for Radius/Width Sync ---
 def sync_radius_from_width():
     """Callback to update radius when width changes."""
-    st.session_state.radius = st.session_state.width / (2 * np.pi)
+    if st.session_state.edited_image is None:
+        st.session_state.radius = st.session_state.width / (2 * np.pi)
+    else:
+        st.session_state.radius = st.session_state.width / (2 * np.pi)*st.session_state.edited_image.size[1]/st.session_state.edited_image.size[0]    
 
 def correct_overhangs(image, angle_deg, radius, displacement, dpi, allow_upscaling,
                       l_to_r=True, r_to_l=True, t_to_b=True, b_to_t=True):
@@ -360,12 +363,12 @@ st.markdown("This tool creates a 3D printable 'Lithophane-Roller' from an image.
 with st.sidebar:
     st.header("⚙️ Settings")
     st.number_input(
-        "Breite (Umfang in mm)",
+        "set width (in mm)",
         key='width',
         on_change=sync_radius_from_width,
         step=1.0,
         format="%.2f",
-        help="Geben Sie die gewünschte Breite (Umfang) des Zylinders an. Der Radius wird automatisch angepasst."
+        help="Enter the width to set the radius accordingly, respecting image aspect ratio"
     )
 
     st.slider(
@@ -418,10 +421,12 @@ with col1:
             if st.button("Undo", use_container_width=True, disabled=st.session_state.history_index <= 0):
                 st.session_state.history_index -= 1
                 st.session_state.edited_image = st.session_state.image_history[st.session_state.history_index]
+                st.rerun()
         with col_undo_redo2:
             if st.button("Redo", use_container_width=True, disabled=st.session_state.history_index >= len(st.session_state.image_history) - 1):
                 st.session_state.history_index += 1
                 st.session_state.edited_image = st.session_state.image_history[st.session_state.history_index]
+                st.rerun()
 
         # Basic editing tools
         st.markdown("---")
@@ -439,6 +444,7 @@ with col1:
             if st.button("Apply Threshold", use_container_width=True):
                 thresholded_image = st.session_state.edited_image.convert('L').point(lambda p: 255 if p > threshold_value else 0, '1')
                 add_to_history(thresholded_image)
+                st.rerun()
 
         # Gaussian Blur
         st.markdown("---")
@@ -449,6 +455,7 @@ with col1:
             if st.button("Apply Blur", use_container_width=True):
                 blurred_image = st.session_state.edited_image.convert('L').filter(ImageFilter.GaussianBlur(radius=blur_radius))
                 add_to_history(blurred_image)
+                st.rerun()
 
         # Overhang Correction
         st.markdown("---")
