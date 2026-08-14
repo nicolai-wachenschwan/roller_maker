@@ -469,6 +469,26 @@ def _axis_cylinder(mesh: trimesh.Trimesh, axis_diameter_mm: float,
     return cyl
 
 
+def check_no_overlap(mesh_a: trimesh.Trimesh, mesh_b: trimesh.Trimesh,
+                      volume_tolerance: float = 1e-6) -> tuple[bool, float]:
+    """Rechnet die tatsaechliche Boolean-Schnittmenge zweier Meshes aus und
+    gibt (ist_ueberlappungsfrei, ueberlappungsvolumen_mm3) zurueck.
+
+    Das ist die einzige verlaessliche Pruefung dafuer, ob zwei Teile sich im
+    selben Bauraum wirklich nicht beruehren -- reine Radius-Buchhaltung kann
+    (wie sich hier gezeigt hat) trotz "richtig aussehender" Formeln trotzdem
+    zwei sich massiv ueberlappende Volumenkoerper erzeugen.
+    """
+    try:
+        overlap = mesh_a.intersection(mesh_b, engine="manifold")
+    except Exception as exc:  # pragma: no cover - defensive
+        return False, float("nan")
+    if overlap.is_empty:
+        return True, 0.0
+    vol = abs(overlap.volume)
+    return vol <= volume_tolerance, vol
+
+
 def build_dual_cylinder(
     cut_mask: np.ndarray,
     radius_mm: float,
@@ -479,12 +499,23 @@ def build_dual_cylinder(
     axis_diameter_mm: float | None = 6.0,
     bridge_width_px: int = 2,
     cut_through: bool = True,
+    verify_no_overlap: bool = True,
 ) -> tuple[trimesh.Trimesh, trimesh.Trimesh, dict]:
     """Erzeugt Schale (mit Loechern) und Kern (mit passenden Stopfen) fuer
     das Rotations-Auswerfer-Konzept.
 
     cut_mask.shape == (ny, nx), True == hier wird geschnitten (Loch).
     axis 0 (ny) = Umfang/theta (periodisch), axis 1 (nx) = Achse/z (offen).
+
+    Wichtig zur Kollisionsfreiheit: beide Teile werden zunaechst als volle
+    Rotationskoerper von der Mittelachse aus aufgebaut (wie das bestehende
+    Lithophane-Verfahren). Das allein GARANTIERT noch keinen Bauraum fuer
+    den jeweils anderen Teil -- Kern und Schale wuerden sich sonst im
+    gesamten Bereich von der Achse bis zu ihrem jeweiligen Musterradius
+    ueberlappen. Deshalb wird aus der Schale explizit ein "Freiraum-Koerper"
+    (Kern-Kontur + radial_clearance_mm) per Boolean-Differenz herausgeschnitten
+    -- das erzwingt die radiale Zonierung geometrisch statt sie nur uebers
+    Zahlenwerk zu unterstellen.
     """
     ny, nx = cut_mask.shape
     repaired_mask, report = repair_cut_mask(cut_mask, bridge_width_px=bridge_width_px)
@@ -492,30 +523,6 @@ def build_dual_cylinder(
     circumference_mm = 2 * np.pi * radius_mm
     pixel_pitch_theta_mm = circumference_mm / ny
     pixel_pitch_z_mm = height_mm / max(nx - 1, 1)
-
-    # --- Schale: Loecher als tiefe Einstuelpung (fuer sauberen Durchbruch
-    # per anschliessender Achs-Boolean, analog zum bestehenden hole_threshold
-    # Verfahren) ---
-    shell_field = np.where(
-        repaired_mask,
-        radius_mm - wall_thickness_mm * 2.0,   # tief -> wird spaeter Loch
-        radius_mm + wall_thickness_mm,          # normale Schneidenwand
-    )
-    shell_vertices = _vertices_from_radius_field(shell_field, radius_mm, height_mm)
-    shell_mesh = _finish_mesh(shell_vertices, ny, nx)
-
-    if cut_through and axis_diameter_mm:
-        try:
-            axis_cyl = _axis_cylinder(shell_mesh, axis_diameter_mm)
-            cut_result = shell_mesh.difference(axis_cyl, engine="manifold")
-            if not cut_result.is_empty:
-                shell_mesh = cut_result
-                report["axis_hole_cut"] = True
-            else:
-                report["axis_hole_cut"] = False
-        except Exception as exc:  # pragma: no cover - defensive
-            report["axis_hole_cut"] = False
-            report["axis_hole_error"] = str(exc)
 
     # --- Kern: Stopfen an derselben Position wie die Loecher (Ruhelage,
     # KEINE Phasenverschiebung -- siehe Modul-Docstring), leicht erodiert
@@ -531,16 +538,59 @@ def build_dual_cylinder(
     core_vertices = _vertices_from_radius_field(core_field, radius_mm, height_mm)
     core_mesh = _finish_mesh(core_vertices, ny, nx)
 
-    if axis_diameter_mm:
-        try:
-            axis_cyl = _axis_cylinder(core_mesh, axis_diameter_mm)
-            cut_result = core_mesh.difference(axis_cyl, engine="manifold")
-            if not cut_result.is_empty:
-                core_mesh = cut_result
-        except Exception:  # pragma: no cover - defensive
-            pass
+    # --- Freiraum-Koerper: Kern-Kontur + Sicherheitsabstand, dient NUR dazu,
+    # die Schale radial auszusparen -- wird selbst nicht exportiert. ---
+    clearance_field = core_field + radial_clearance_mm
+    clearance_vertices = _vertices_from_radius_field(clearance_field, radius_mm, height_mm)
+    clearance_mesh = _finish_mesh(clearance_vertices, ny, nx)
+
+    # --- Schale: volle Musterkontur, danach um den Freiraum-Koerper
+    # ausgespart -- das erzeugt die duenne Ring-Wand UND die Loch-Bereiche
+    # (dort ist shell_field ohnehin sehr tief, siehe unten) in einem Schritt. ---
+    shell_field = np.where(
+        repaired_mask,
+        radius_mm - wall_thickness_mm * 2.0,   # tief -> wird Loch
+        radius_mm + wall_thickness_mm,          # normale Schneidenwand
+    )
+    shell_vertices = _vertices_from_radius_field(shell_field, radius_mm, height_mm)
+    shell_mesh = _finish_mesh(shell_vertices, ny, nx)
+
+    try:
+        carved = shell_mesh.difference(clearance_mesh, engine="manifold")
+        if not carved.is_empty:
+            shell_mesh = carved
+            report["clearance_carved"] = True
+        else:
+            report["clearance_carved"] = False
+    except Exception as exc:  # pragma: no cover - defensive
+        report["clearance_carved"] = False
+        report["clearance_carve_error"] = str(exc)
+
+    # --- Achsbohrung fuer die Handkurbel/Achse durch BEIDE Teile ---
+    if axis_diameter_mm and cut_through:
+        for name, mesh in (("shell", shell_mesh), ("core", core_mesh)):
+            try:
+                axis_cyl = _axis_cylinder(mesh, axis_diameter_mm)
+                cut_result = mesh.difference(axis_cyl, engine="manifold")
+                if not cut_result.is_empty:
+                    if name == "shell":
+                        shell_mesh = cut_result
+                    else:
+                        core_mesh = cut_result
+                    report[f"axis_hole_cut_{name}"] = True
+                else:
+                    report[f"axis_hole_cut_{name}"] = False
+            except Exception as exc:  # pragma: no cover - defensive
+                report[f"axis_hole_cut_{name}"] = False
+                report[f"axis_hole_error_{name}"] = str(exc)
 
     report["plug_pixels"] = int(plug_mask.sum())
+
+    if verify_no_overlap:
+        ok, vol = check_no_overlap(shell_mesh, core_mesh)
+        report["overlap_free"] = ok
+        report["overlap_volume_mm3"] = vol
+
     return shell_mesh, core_mesh, report
 
 
@@ -647,10 +697,34 @@ def _test_end_to_end_mesh_smoke():
     assert len(core_mesh.faces) > 0, "Kern hat keine Flaechen"
     assert report["remaining_islands"] == 0
     assert report["remaining_severing_rings"] == []
+    assert report["overlap_free"], f"Schale und Kern ueberlappen: {report['overlap_volume_mm3']} mm3"
     print(
         f"PASS: End-to-End Mesh-Erzeugung ohne Fehler "
         f"(Schale: {len(shell_mesh.faces)} Faces, Kern: {len(core_mesh.faces)} Faces)"
     )
+
+
+def _test_shell_and_core_do_not_overlap():
+    """Der eigentliche Kernpunkt der ganzen Diskussion: Schale und Kern
+    duerfen im gleichen Bauraum liegen, aber niemals denselben Raum
+    beanspruchen. Das wird hier NICHT ueber die Radius-Formeln unterstellt,
+    sondern per echter Boolean-Schnittmenge nachgerechnet -- inklusive der
+    Achsbohrung, also am realistischen End-Produkt."""
+    ny, nx = 40, 24
+    hole = np.zeros((ny, nx), dtype=bool)
+    hole[8:32, 6:18] = True
+    hole[16:20, 10:14] = False   # Insel
+
+    shell_mesh, core_mesh, report = build_dual_cylinder(
+        hole, radius_mm=20.0, height_mm=30.0, wall_thickness_mm=1.5,
+        radial_clearance_mm=0.4, axis_diameter_mm=6.0, cut_through=True,
+    )
+    ok, vol = check_no_overlap(shell_mesh, core_mesh)
+    assert ok, (
+        f"Schale und Kern ueberlappen um {vol:.2f} mm3 -- die radiale "
+        f"Zonierung ist NICHT geometrisch erzwungen worden"
+    )
+    print(f"PASS: Schale und Kern sind ueberlappungsfrei (Schnittvolumen: {vol:.4f} mm3)")
 
 
 def run_self_tests():
@@ -660,6 +734,7 @@ def run_self_tests():
     _test_severing_ring_is_detected_and_fixed()
     _test_wraparound_seam_is_one_component()
     _test_end_to_end_mesh_smoke()
+    _test_shell_and_core_do_not_overlap()
     print("=== Alle Tests bestanden ===")
 
 
