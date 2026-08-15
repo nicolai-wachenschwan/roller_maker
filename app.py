@@ -9,6 +9,8 @@ import io
 import trimesh
 from stpyvista.utils import start_xvfb
 
+from dual_cylinder_ejector import image_to_cut_mask, build_dual_cylinder
+
 
 try:
     start_xvfb()
@@ -24,6 +26,18 @@ if 'cutter_mesh' not in st.session_state:
 
 if 'output_filename' not in st.session_state:
     st.session_state.output_filename = None
+
+# --- Additions for the two-part rotational ejector system ---
+if 'shell_mesh' not in st.session_state:
+    st.session_state.shell_mesh = None
+if 'core_mesh' not in st.session_state:
+    st.session_state.core_mesh = None
+if 'ejector_report' not in st.session_state:
+    st.session_state.ejector_report = None
+if 'shell_filename' not in st.session_state:
+    st.session_state.shell_filename = None
+if 'core_filename' not in st.session_state:
+    st.session_state.core_filename = None
 
 # --- Additions for Image Editing ---
 if 'original_image' not in st.session_state:
@@ -387,19 +401,49 @@ with st.sidebar:
     
     st.header("🔧 Axis")
     create_axis_hole = st.checkbox("Create hole for axis", value=True,
-                                  help="Creates a through-hole for an axis")
+                                  help="Creates a through-hole for an axis",
+                                  key="create_axis_hole")
     if create_axis_hole:
         axis_diameter = st.slider("Axis Diameter (in mm)", 1.0, min(radius * 1.8, 50.0), 6.0, 0.5,
                                  help=f"Maximum: {min(radius * 1.8, 50.0):.1f}mm (90% of base radius)")
         if axis_diameter >= radius * 0.9:
             st.warning("⚠️ Axis very thick - may cause structural problems")
 
+    st.header("🔄 Zwei-Teile-Auswerfer")
+    generate_ejector_system = st.checkbox(
+        "Schale + Auswerfer-Kern statt Einzelteil erzeugen", value=False,
+        help="Rotations-Wisch-Auswerfer-Konzept: Schale mit Loechern + passender "
+             "Kern (dual_cylinder_ejector.py). Braucht eine Achsbohrung.",
+        key="generate_ejector_system",
+    )
+    if generate_ejector_system:
+        ejector_threshold = st.slider(
+            "Schnitt-Schwellwert (Helligkeit)", 0, 255, 128, 1,
+            help="Pixel dunkler als dieser Wert werden zu Loechern in der Schale.",
+            key="ejector_threshold",
+        )
+        ejector_clearance = st.slider(
+            "Bewegungsspiel Kern/Schale (mm)", 0.1, 2.0, 0.4, 0.05,
+            help="Radialer und angularer Toleranzspalt, damit sich der Kern "
+                 "reibungsfrei in der Schale verdrehen laesst.",
+            key="ejector_clearance",
+        )
+        ejector_flush_offset = st.slider(
+            "Buendig-Versatz der Stopfen (mm)", 0.0, 1.0, 0.2, 0.05,
+            help="Wie weit die Kern-Stopfen in Ruheposition unter die "
+                 "Schalen-Aussenflaeche zurueckgesetzt sind.",
+            key="ejector_flush_offset",
+        )
+        if not create_axis_hole:
+            st.warning("⚠️ Der Auswerfer benoetigt eine Achsbohrung ('Create hole for axis').")
+
 # -- MAIN AREA --
 col1, col2 = st.columns([1, 1])
 
 with col1:
     st.header("📤 Image Upload")
-    uploaded_file = st.file_uploader("Upload Image", type=["png", "jpg", "jpeg", "bmp"])
+    uploaded_file = st.file_uploader("Upload Image", type=["png", "jpg", "jpeg", "bmp"],
+                                      key="uploaded_file")
     
     if uploaded_file:
         # Initialize editing state when a new image is uploaded
@@ -525,60 +569,182 @@ with col1:
         axis_suffix = f"_axis{int(axis_diameter)}" if create_axis_hole else ""
         st.session_state.output_filename = f"{base_filename}_r{int(radius)}_d{int(displacement)}_dpi{int(dpi)}{upscale_suffix}{axis_suffix}.stl"
         
-        if st.button("🚀 Generate 3D Model", use_container_width=True, type="primary"):
-            # Create status placeholder
+        if generate_ejector_system:
+            st.session_state.shell_filename = f"{base_filename}_r{int(radius)}_shell.stl"
+            st.session_state.core_filename = f"{base_filename}_r{int(radius)}_core.stl"
+
+        generate_disabled = generate_ejector_system and not create_axis_hole
+        if st.button("🚀 Generate 3D Model", use_container_width=True, type="primary",
+                     disabled=generate_disabled, key="generate_button"):
             status_placeholder = st.empty()
             progress_bar = st.progress(0)
-            
-            def update_status(message):
-                status_placeholder.info(message)
-            
-            # Attach status callback to function
-            create_cylinder_mesh.status_callback = update_status
-            
-            try:
-                progress_bar.progress(10)
-                # Convert the edited PIL image to an in-memory file for processing
-                image_buffer = io.BytesIO()
-                st.session_state.edited_image.save(image_buffer, format="PNG")
-                image_buffer.seek(0)
 
-                # Calculate the mesh and save it as a trimesh object
-                if create_axis_hole:
-                    st.session_state.mesh = create_cylinder_mesh(
-                        image_buffer, radius, displacement, dpi, allow_upscaling,
-                        create_axis_hole, axis_diameter
+            # Reset both output modes so preview/download reflects only the
+            # freshly generated result.
+            st.session_state.mesh = None
+            st.session_state.shell_mesh = None
+            st.session_state.core_mesh = None
+            st.session_state.ejector_report = None
+
+            if generate_ejector_system:
+                try:
+                    progress_bar.progress(10)
+                    status_placeholder.info("📷 Bild wird aufbereitet...")
+                    resized_img, _, physical_dims = resize_image_for_dpi(
+                        st.session_state.edited_image, radius, dpi, allow_upscaling
                     )
-                else:
-                    st.session_state.mesh = create_cylinder_mesh(
-                        image_buffer, radius, displacement, dpi, allow_upscaling
+                    cylinder_height_mm, _ = physical_dims
+                    cut_mask = image_to_cut_mask(
+                        np.array(resized_img.convert('L')), ejector_threshold
                     )
-                
-                progress_bar.progress(100)
-                status_placeholder.success("✅ Model generated successfully!")
-                st.balloons()  # Celebration effect!
-                
-            except ValueError as e:
-                progress_bar.progress(0)
-                status_placeholder.error(f"❌ Error during mesh generation: {e}")
-                st.session_state.mesh = None
-            finally:
-                # Clean up callback
-                create_cylinder_mesh.status_callback = None
+
+                    progress_bar.progress(40)
+                    status_placeholder.info("🏗️ Schale und Kern werden erzeugt...")
+                    shell_mesh, core_mesh, ejector_report = build_dual_cylinder(
+                        cut_mask,
+                        radius_mm=radius,
+                        height_mm=cylinder_height_mm,
+                        wall_thickness_mm=displacement,
+                        radial_clearance_mm=ejector_clearance,
+                        flush_offset_mm=ejector_flush_offset,
+                        axis_diameter_mm=axis_diameter,
+                        cut_through=True,
+                    )
+                    st.session_state.shell_mesh = shell_mesh
+                    st.session_state.core_mesh = core_mesh
+                    st.session_state.ejector_report = ejector_report
+
+                    progress_bar.progress(100)
+                    if ejector_report.get("overlap_free", True):
+                        status_placeholder.success("✅ Schale und Kern erfolgreich erzeugt!")
+                        st.balloons()
+                        with st.expander("🔍 Topologie-Reparatur-Report", expanded=False):
+                            if ejector_report["severing_rings_found"]:
+                                st.warning(
+                                    f"{len(ejector_report['severing_rings_found'])} Trennring(e) "
+                                    f"gefunden und mit Stegen repariert."
+                                )
+                            if ejector_report["islands_found"]:
+                                st.warning(
+                                    f"{ejector_report['islands_found']} freischwebende Insel(n) "
+                                    f"gefunden und automatisch angebunden."
+                                )
+                            if not ejector_report["severing_rings_found"] and not ejector_report["islands_found"]:
+                                st.info("Keine Trennringe oder Inseln im Muster gefunden.")
+                            st.metric("Überlappungsvolumen (Soll: 0)",
+                                      f"{ejector_report.get('overlap_volume_mm3', 0):.4f} mm³")
+                    else:
+                        status_placeholder.error(
+                            f"⚠️ Schale und Kern ueberlappen "
+                            f"({ejector_report.get('overlap_volume_mm3', 0):.2f} mm³)! "
+                            "Bitte Bewegungsspiel erhoehen."
+                        )
+                except Exception as e:
+                    progress_bar.progress(0)
+                    status_placeholder.error(f"❌ Error during ejector generation: {e}")
+                    st.session_state.shell_mesh = None
+                    st.session_state.core_mesh = None
+            else:
+                # Create status placeholder
+                def update_status(message):
+                    status_placeholder.info(message)
+
+                # Attach status callback to function
+                create_cylinder_mesh.status_callback = update_status
+
+                try:
+                    progress_bar.progress(10)
+                    # Convert the edited PIL image to an in-memory file for processing
+                    image_buffer = io.BytesIO()
+                    st.session_state.edited_image.save(image_buffer, format="PNG")
+                    image_buffer.seek(0)
+
+                    # Calculate the mesh and save it as a trimesh object
+                    if create_axis_hole:
+                        st.session_state.mesh = create_cylinder_mesh(
+                            image_buffer, radius, displacement, dpi, allow_upscaling,
+                            create_axis_hole, axis_diameter
+                        )
+                    else:
+                        st.session_state.mesh = create_cylinder_mesh(
+                            image_buffer, radius, displacement, dpi, allow_upscaling
+                        )
+
+                    progress_bar.progress(100)
+                    status_placeholder.success("✅ Model generated successfully!")
+                    st.balloons()  # Celebration effect!
+
+                except ValueError as e:
+                    progress_bar.progress(0)
+                    status_placeholder.error(f"❌ Error during mesh generation: {e}")
+                    st.session_state.mesh = None
+                finally:
+                    # Clean up callback
+                    create_cylinder_mesh.status_callback = None
     else:
         st.info("Please upload an image file to begin.")
 
-# Check if a mesh exists in the session_state to display/download it
-if st.session_state.mesh and not st.session_state.mesh.is_empty:
+has_ejector_result = (
+    st.session_state.shell_mesh is not None and not st.session_state.shell_mesh.is_empty
+    and st.session_state.core_mesh is not None and not st.session_state.core_mesh.is_empty
+)
+has_single_result = st.session_state.mesh and not st.session_state.mesh.is_empty
+
+if has_ejector_result:
     with col2:
         st.header("🖼️ 3D Preview")
         try:
             plotter = pv.Plotter(window_size=[600, 600], border=False)
-            
+            pv_shell = pv.wrap(st.session_state.shell_mesh)
+            pv_core = pv.wrap(st.session_state.core_mesh)
+            plotter.add_mesh(pv_shell, color="lightblue", opacity=0.55,
+                              smooth_shading=True, name="shell")
+            plotter.add_mesh(pv_core, color="ivory", smooth_shading=True, name="core")
+            plotter.view_isometric()
+            plotter.background_color = '#262730'
+            stpyvista(plotter, key="pv_ejector")
+        except Exception as e:
+            st.error(f"Error in 3D display: {e}")
+            st.warning("The 3D preview could not be loaded. You can still download the STL files though.")
+
+    st.header("💾 Download")
+    try:
+        col_dl_1, col_dl_2 = st.columns(2)
+
+        with col_dl_1:
+            st.subheader("Schale")
+            with io.BytesIO() as f:
+                st.session_state.shell_mesh.export(f, file_type='stl')
+                f.seek(0)
+                shell_data = f.read()
+            st.metric("Faces", len(st.session_state.shell_mesh.faces))
+            st.download_button("📥 Download Schale", shell_data,
+                                st.session_state.shell_filename, "model/stl",
+                                use_container_width=True, type="primary")
+
+        with col_dl_2:
+            st.subheader("Kern")
+            with io.BytesIO() as f:
+                st.session_state.core_mesh.export(f, file_type='stl')
+                f.seek(0)
+                core_data = f.read()
+            st.metric("Faces", len(st.session_state.core_mesh.faces))
+            st.download_button("📥 Download Kern", core_data,
+                                st.session_state.core_filename, "model/stl",
+                                use_container_width=True, type="primary")
+    except Exception as e:
+        st.error(f"Error creating the download file: {e}")
+
+elif has_single_result:
+    with col2:
+        st.header("🖼️ 3D Preview")
+        try:
+            plotter = pv.Plotter(window_size=[600, 600], border=False)
+
             # **DISPLAY-CHANGE: Convert trimesh for PyVista with pv.wrap()**
             # stpyvista needs a PyVista object. pv.wrap is the easiest way.
             pv_mesh = pv.wrap(st.session_state.mesh)
-            
+
             plotter.add_mesh(pv_mesh, color="ivory", smooth_shading=True)
             plotter.view_isometric()
             plotter.background_color = '#262730'
@@ -610,7 +776,7 @@ if st.session_state.mesh and not st.session_state.mesh.is_empty:
         with col_dl3:
             volume = st.session_state.mesh.volume
             st.metric("Volume", f"{volume:.2f} mm³")
-        
+
         # Show additional mesh info if axis hole was created
         if create_axis_hole and 'axis_diameter' in locals():
             col_axis1, col_axis2 = st.columns(2)
