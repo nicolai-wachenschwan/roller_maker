@@ -1,6 +1,6 @@
-streamlit 
-numpy 
-Pillow 
+streamlit <1.50
+numpy
+Pillow
 pyvista <=0.45
 stpyvista 
 scipy 
