@@ -3,8 +3,7 @@ import numpy as np
 from PIL import Image, ImageOps, ImageFilter
 import pyvista as pv
 from stpyvista import stpyvista
-from scipy.spatial import Delaunay
-from shapely.geometry import Polygon, Point
+from shapely.geometry import Polygon
 import io
 import trimesh
 from stpyvista.utils import start_xvfb
@@ -297,8 +296,15 @@ def map_image_to_vertices(img_array, base_radius, max_displacement):
     
     # Z-coordinates map to image width (horizontal direction becomes cylinder height)
     z_coords = (x_indices / (nx - 1)) * effective_height
-    # Theta maps to image height (vertical direction becomes cylinder circumference)  
-    theta = (y_indices / (ny - 1)) * 2 * np.pi
+    # Theta maps to image height (vertical direction becomes cylinder circumference).
+    # BUGFIX: theta is PERIODIC (row 0 and row ny-1 are adjacent on the cylinder,
+    # not the same angle) so it must use an endpoint-exclusive sampling (divide by
+    # ny, not ny-1). The previous "/(ny-1)" made the last row hit theta=2*pi,
+    # i.e. the exact same angle as row 0. For a seamlessly tileable image (where
+    # row 0 and row ny-1 differ slightly, by design, to continue the pattern) this
+    # created near-duplicate boundary vertices at different radii right at the
+    # theta=0 seam -- a degenerate fold that breaks the mesh's watertightness.
+    theta = (y_indices / ny) * 2 * np.pi
     
     zz, tt = np.meshgrid(z_coords, theta, indexing='ij')
     
@@ -332,31 +338,47 @@ def create_body_mesh(vertices, nx, ny):
     return trimesh.Trimesh(vertices=vertices, faces=np.array(faces))
 
 def create_cap_mesh(all_vertices, edge_indices, is_bottom):
-    """Triangulates the cap surfaces using Delaunay and returns a trimesh.Trimesh."""
+    """Triangulates the cap surfaces and returns a trimesh.Trimesh.
+
+    BUGFIX: this used to run an unconstrained scipy Delaunay triangulation
+    over the ring points and keep only the triangles whose centroid tested
+    inside the boundary polygon. That is unreliable for jagged/star-shaped
+    cap rings (busy image patterns produce exactly this kind of boundary):
+    legitimate triangles near concave notches can have a centroid that
+    falls just outside the polygon and get dropped, leaving the cap with
+    holes -- i.e. a non-watertight mesh. Downstream this shows up as
+    broken normals/geometry and, for the dual-cylinder ejector, boolean
+    overlap checks against a non-watertight mesh producing NaN.
+
+    Fix: triangulate the ring itself via ear clipping (mapbox_earcut,
+    through trimesh.creation.triangulate_polygon), which always closes the
+    cap for any simple polygon regardless of how concave it is.
+    """
     edge_vertices = all_vertices[edge_indices]
     if edge_vertices.shape[0] < 3: return trimesh.Trimesh()
 
     points_2d = edge_vertices[:, :2]
     boundary_polygon = Polygon(points_2d)
+    if boundary_polygon.area == 0:
+        return trimesh.Trimesh()
 
     try:
-        # Perform Delaunay triangulation on the 2D points
-        tri = Delaunay(points_2d)
+        tri_vertices_2d, cap_faces = trimesh.creation.triangulate_polygon(
+            boundary_polygon, engine="earcut"
+        )
     except Exception:
         return trimesh.Trimesh()
 
-    # Filter triangles whose centroid is inside the boundary polygon
-    filtered_simplices = [
-        s for s in tri.simplices if boundary_polygon.contains(Point(np.mean(points_2d[s], axis=0)))
-    ]
-    if not filtered_simplices: return trimesh.Trimesh()
+    if cap_faces is None or len(cap_faces) == 0:
+        return trimesh.Trimesh()
 
-    # **TRIMESH-CHANGE: Direct use of the simplices as faces**
-    # trimesh needs a simple list of triangle indices.
-    # The indices in 'filtered_simplices' refer to the 'edge_vertices' array.
-    # We have to map them back to the indices in the global 'all_vertices' array.
-    cap_faces = np.array(filtered_simplices)
-    
+    # earcut triangulates using exactly the input ring vertices (in order,
+    # with the closing/repeated first point appended) -- no Steiner points
+    # are inserted -- so face indices map 1:1 back onto ``edge_indices``.
+    n_ring = points_2d.shape[0]
+    if tri_vertices_2d.shape[0] != n_ring + 1 or cap_faces.max() >= n_ring:
+        return trimesh.Trimesh()
+
     # Reverse triangle orientation for the bottom so that the normals point outwards
     if is_bottom:
         cap_faces = cap_faces[:, [0, 2, 1]]

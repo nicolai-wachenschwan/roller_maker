@@ -73,8 +73,7 @@ from __future__ import annotations
 
 import numpy as np
 from scipy import ndimage
-from scipy.spatial import Delaunay
-from shapely.geometry import Polygon, Point
+from shapely.geometry import Polygon
 import trimesh
 
 
@@ -412,28 +411,55 @@ def _body_mesh(vertices: np.ndarray, ny: int, nx: int) -> trimesh.Trimesh:
 
 def _cap_mesh(all_vertices: np.ndarray, edge_indices: np.ndarray,
               is_bottom: bool) -> trimesh.Trimesh:
+    """Triangulates the (usually highly non-convex/star-shaped) cap boundary
+    ring.
+
+    HISTORY / BUGFIX: this used to run an unconstrained scipy Delaunay
+    triangulation over the ring points and then keep only the triangles
+    whose centroid tested inside the boundary polygon (shapely
+    ``contains``). That approach is fundamentally unreliable for the kind
+    of jagged, spiky ring shapes that come out of a busy raster pattern
+    (e.g. many thin holes reaching the cap edge): legitimate boundary
+    triangles near concave notches routinely have a centroid that falls
+    just outside the polygon and get silently dropped, and any ring for
+    which shapely flags the polygon as technically "invalid" (self-touching
+    at a single point, an extremely common occurrence for spiky pixel-grid
+    rings) caused the cap to be skipped ENTIRELY. Either way the result is
+    a cap with holes or no cap at all -> a non-watertight shell/core mesh
+    -> ``trimesh``'s boolean/volume ops on that mesh return garbage or
+    raise, which is exactly the "overlap becomes NaN" symptom.
+
+    Fix: use a proper constrained polygon triangulation (ear clipping via
+    ``mapbox_earcut``) that triangulates strictly using the ring's own
+    vertices/edges and therefore always closes the cap for any simple
+    polygon, no matter how concave/star-shaped.
+    """
     edge_vertices = all_vertices[edge_indices]
     if edge_vertices.shape[0] < 3:
         return trimesh.Trimesh()
 
     points_2d = edge_vertices[:, :2]
     boundary_polygon = Polygon(points_2d)
-    if not boundary_polygon.is_valid or boundary_polygon.area == 0:
+    if boundary_polygon.area == 0:
         return trimesh.Trimesh()
 
     try:
-        tri = Delaunay(points_2d)
+        tri_vertices_2d, cap_faces = trimesh.creation.triangulate_polygon(
+            boundary_polygon, engine="earcut"
+        )
     except Exception:
         return trimesh.Trimesh()
 
-    filtered = [
-        s for s in tri.simplices
-        if boundary_polygon.contains(Point(np.mean(points_2d[s], axis=0)))
-    ]
-    if not filtered:
+    if cap_faces is None or len(cap_faces) == 0:
         return trimesh.Trimesh()
 
-    cap_faces = np.array(filtered)
+    # earcut triangulates using exactly the input ring vertices (in order,
+    # with the closing/repeated first point appended) -- no Steiner points
+    # are inserted -- so face indices map 1:1 back onto ``edge_indices``.
+    n_ring = points_2d.shape[0]
+    if tri_vertices_2d.shape[0] != n_ring + 1 or cap_faces.max() >= n_ring:
+        return trimesh.Trimesh()
+
     if is_bottom:
         cap_faces = cap_faces[:, [0, 2, 1]]
     global_faces = edge_indices[cap_faces]
@@ -727,6 +753,97 @@ def _test_shell_and_core_do_not_overlap():
     print(f"PASS: Schale und Kern sind ueberlappungsfrei (Schnittvolumen: {vol:.4f} mm3)")
 
 
+def _test_cap_triangulation_closes_star_shaped_ring():
+    """Regressionstest fuer den urspruenglichen NaN-Overlap-Bug: die
+    Endkappen-Ringe eines Schnittmusters koennen stark konkav/sternfoermig
+    sein (viele unregelmaessige Zacken zwischen "Loch" und "Material"), wie
+    es bei einem organischen Bildmuster (z.B. dem Puzzleteil-Muster aus dem
+    Bugreport) am Kappen-Rand entsteht. Die alte Implementierung
+    (unconstrained scipy-Delaunay + Zentroid-in-Polygon-Filter) hat dabei
+    reproduzierbar legitime Randdreiecke verworfen und die Kappe nicht
+    vollstaendig geschlossen (an genau diesem festen Seed/Profil verwarf
+    sie 16 von 150 Randkanten) -- das musste als nicht-wasserdichtes Mesh
+    enden. Hier direkt geprueft: die Kappe muss GENAU einen geschlossenen
+    Randloop mit `ny` Kanten haben (keine Loecher, keine fehlenden
+    Dreiecke)."""
+    rng = np.random.default_rng(12345)
+    ny = 150
+    theta = np.linspace(0, 2 * np.pi, ny, endpoint=False)
+    # Unregelmaessiges, aber deterministisches Radiusprofil (mehrere
+    # ueberlagerte Frequenzen + Rauschen) -- deutlich realistischer als ein
+    # rein periodischer Zacken-Ring und reproduzierbar fehlschlagend mit der
+    # alten Delaunay/Zentroid-Implementierung.
+    base = 20 + 8 * np.sin(theta * 5) + 4 * np.sin(theta * 17 + 1)
+    noise = rng.normal(0, 3.0, ny)
+    radius = np.clip(base + noise, 1.0, None)
+    x = radius * np.cos(theta)
+    y = radius * np.sin(theta)
+    z = np.zeros(ny)
+    vertices = np.column_stack([x, y, z])
+    edge_indices = np.arange(ny)
+
+    cap = _cap_mesh(vertices, edge_indices, is_bottom=True)
+    assert not cap.is_empty, "Kappe fuer sternfoermigen Ring ist leer"
+
+    boundary_edges = trimesh.grouping.group_rows(cap.edges_sorted, require_count=1)
+    assert len(boundary_edges) == ny, (
+        f"Kappen-Rand hat {len(boundary_edges)} offene Kanten, erwartet genau {ny} "
+        f"(ein einziger geschlossener Loop) -- die Kappe hat Loecher"
+    )
+    print(
+        f"PASS: Kappen-Triangulierung schliesst auch unregelmaessige, "
+        f"sternfoermige Ringe vollstaendig ({len(cap.faces)} Dreiecke, {ny} Randkanten)"
+    )
+
+
+def _seamless_tileable_grid_mask(ny: int = 220, nx: int = 300) -> np.ndarray:
+    """Baut eine Lochmaske, die einem nahtlos kachelbaren Muster (wie das
+    Puzzleteil-Hintergrundbild, das den urspruenglichen Bug ausgeloest hat)
+    nachempfunden ist: mehrere wellenfoermige Gitterlinien, die -- weil das
+    Muster zum Kacheln gedacht ist -- den oberen/unteren UND linken/rechten
+    Bildrand mehrfach mit Zacken durchqueren, statt sauber am Rand
+    abzuschliessen."""
+    xs = np.arange(nx)
+    ys = np.arange(ny)
+    img = np.full((ny, nx), 255, dtype=np.uint8)
+    for row_base in (0, ny // 3, 2 * ny // 3, ny - 1):
+        wave = (25 * np.sin(xs / 18.0)).astype(int)
+        for x in xs:
+            y0 = (row_base + wave[x]) % ny
+            img[max(0, y0 - 2):y0 + 2, x] = 15
+    for col_base in (0, nx // 4, nx // 2, 3 * nx // 4, nx - 1):
+        wave = (25 * np.sin(ys / 18.0)).astype(int)
+        for y in ys:
+            x0 = min(max(col_base + wave[y], 0), nx - 1)
+            img[y, max(0, x0 - 2):x0 + 2] = 15
+    return image_to_cut_mask(img, threshold=128)
+
+
+def _test_seamless_tile_pattern_produces_watertight_overlap_free_result():
+    """End-to-End-Regressionstest fuer den gemeldeten Fehlerfall: ein
+    nahtlos kachelbares Wellenmuster (Puzzleteil-artig) darf weder eine
+    nicht-wasserdichte Schale/Kern noch ein NaN-Ueberlappungsvolumen
+    erzeugen."""
+    mask = _seamless_tileable_grid_mask()
+    shell_mesh, core_mesh, report = build_dual_cylinder(
+        mask, radius_mm=30.0, height_mm=40.0, wall_thickness_mm=2.0,
+        radial_clearance_mm=0.4, axis_diameter_mm=6.0, cut_through=True,
+    )
+    assert shell_mesh.is_watertight, "Schale ist nach dem Kacheltest nicht wasserdicht"
+    assert core_mesh.is_watertight, "Kern ist nach dem Kacheltest nicht wasserdicht"
+    assert not np.isnan(report["overlap_volume_mm3"]), (
+        "Ueberlappungsvolumen ist NaN -- genau der urspruenglich gemeldete Fehlerfall"
+    )
+    assert report["overlap_free"], (
+        f"Schale und Kern ueberlappen beim Kachelmuster-Test: "
+        f"{report['overlap_volume_mm3']} mm3"
+    )
+    print(
+        "PASS: Nahtlos kachelbares Wellenmuster erzeugt wasserdichte, "
+        "ueberlappungsfreie Schale+Kern (kein NaN)"
+    )
+
+
 def run_self_tests():
     print("=== dual_cylinder_ejector.py: Selbsttest Grenzfaelle ===")
     _test_island_is_detected_and_fixed()
@@ -735,6 +852,8 @@ def run_self_tests():
     _test_wraparound_seam_is_one_component()
     _test_end_to_end_mesh_smoke()
     _test_shell_and_core_do_not_overlap()
+    _test_cap_triangulation_closes_star_shaped_ring()
+    _test_seamless_tile_pattern_produces_watertight_overlap_free_result()
     print("=== Alle Tests bestanden ===")
 
 
