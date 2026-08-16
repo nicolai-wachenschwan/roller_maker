@@ -73,8 +73,7 @@ from __future__ import annotations
 
 import numpy as np
 from scipy import ndimage
-from scipy.spatial import Delaunay
-from shapely.geometry import Polygon, Point
+from shapely.geometry import Polygon
 import trimesh
 
 
@@ -412,28 +411,55 @@ def _body_mesh(vertices: np.ndarray, ny: int, nx: int) -> trimesh.Trimesh:
 
 def _cap_mesh(all_vertices: np.ndarray, edge_indices: np.ndarray,
               is_bottom: bool) -> trimesh.Trimesh:
+    """Triangulates the (usually highly non-convex/star-shaped) cap boundary
+    ring.
+
+    HISTORY / BUGFIX: this used to run an unconstrained scipy Delaunay
+    triangulation over the ring points and then keep only the triangles
+    whose centroid tested inside the boundary polygon (shapely
+    ``contains``). That approach is fundamentally unreliable for the kind
+    of jagged, spiky ring shapes that come out of a busy raster pattern
+    (e.g. many thin holes reaching the cap edge): legitimate boundary
+    triangles near concave notches routinely have a centroid that falls
+    just outside the polygon and get silently dropped, and any ring for
+    which shapely flags the polygon as technically "invalid" (self-touching
+    at a single point, an extremely common occurrence for spiky pixel-grid
+    rings) caused the cap to be skipped ENTIRELY. Either way the result is
+    a cap with holes or no cap at all -> a non-watertight shell/core mesh
+    -> ``trimesh``'s boolean/volume ops on that mesh return garbage or
+    raise, which is exactly the "overlap becomes NaN" symptom.
+
+    Fix: use a proper constrained polygon triangulation (ear clipping via
+    ``mapbox_earcut``) that triangulates strictly using the ring's own
+    vertices/edges and therefore always closes the cap for any simple
+    polygon, no matter how concave/star-shaped.
+    """
     edge_vertices = all_vertices[edge_indices]
     if edge_vertices.shape[0] < 3:
         return trimesh.Trimesh()
 
     points_2d = edge_vertices[:, :2]
     boundary_polygon = Polygon(points_2d)
-    if not boundary_polygon.is_valid or boundary_polygon.area == 0:
+    if boundary_polygon.area == 0:
         return trimesh.Trimesh()
 
     try:
-        tri = Delaunay(points_2d)
+        tri_vertices_2d, cap_faces = trimesh.creation.triangulate_polygon(
+            boundary_polygon, engine="earcut"
+        )
     except Exception:
         return trimesh.Trimesh()
 
-    filtered = [
-        s for s in tri.simplices
-        if boundary_polygon.contains(Point(np.mean(points_2d[s], axis=0)))
-    ]
-    if not filtered:
+    if cap_faces is None or len(cap_faces) == 0:
         return trimesh.Trimesh()
 
-    cap_faces = np.array(filtered)
+    # earcut triangulates using exactly the input ring vertices (in order,
+    # with the closing/repeated first point appended) -- no Steiner points
+    # are inserted -- so face indices map 1:1 back onto ``edge_indices``.
+    n_ring = points_2d.shape[0]
+    if tri_vertices_2d.shape[0] != n_ring + 1 or cap_faces.max() >= n_ring:
+        return trimesh.Trimesh()
+
     if is_bottom:
         cap_faces = cap_faces[:, [0, 2, 1]]
     global_faces = edge_indices[cap_faces]

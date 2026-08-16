@@ -6,6 +6,7 @@ stpyvista
 scipy 
 shapely
 trimesh
+mapbox_earcut
 manifold3d
 vtk
 networkx
