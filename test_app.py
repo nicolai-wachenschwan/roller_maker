@@ -12,6 +12,7 @@ Ausfuehren mit: pytest test_app.py -v
 """
 
 import io
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -19,6 +20,15 @@ from PIL import Image, ImageDraw
 from streamlit.testing.v1 import AppTest
 
 APP_TIMEOUT = 60
+
+# Das tatsaechliche Bild aus dem Bugreport (nahtlos kachelbares
+# Puzzleteil-Muster): "wenn ich dieses Bild ... verwende, zeigen die
+# Erhoehungen im core nach aussen und der overlap wird nan". Als Fixture
+# abgelegt, damit der genaue Ausloeser fuer kuenftige Aenderungen als
+# Regressionstest greifbar bleibt statt nur ueber eine Annaeherung.
+PUZZLE_PATTERN_BUGREPORT_PATH = (
+    Path(__file__).parent / "test_assets" / "puzzle_pattern_bugreport.png"
+)
 
 
 def _synthetic_test_image_bytes() -> bytes:
@@ -59,6 +69,23 @@ def _seamless_tileable_test_image_bytes() -> bytes:
             x0 = min(max(col_base + wave[y], 0), nx - 1)
             img_array[y, max(0, x0 - 2):x0 + 2] = 15
     img = Image.fromarray(img_array, mode="L")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _puzzle_pattern_bugreport_image_bytes(max_dim: int = 220) -> bytes:
+    """Laedt das echte Bugreport-Bild und verkleinert es (Seitenverhaeltnis
+    erhalten) auf max_dim px, damit der Test in vertretbarer Zeit laeuft --
+    bei den App-Standardeinstellungen (DPI 150, kein Upscaling) wuerde die
+    Originalaufloesung (780x549) sonst unveraendert durch die ganze
+    Mesh-Erzeugung samt Delaunay-Kappen laufen und den Test stark
+    verlangsamen. Das Fixture-PNG selbst bleibt in Originalaufloesung
+    erhalten, siehe PUZZLE_PATTERN_BUGREPORT_PATH."""
+    img = Image.open(PUZZLE_PATTERN_BUGREPORT_PATH).convert("L")
+    scale = max_dim / max(img.size)
+    new_size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
+    img = img.resize(new_size, Image.Resampling.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
@@ -209,6 +236,44 @@ def test_ejector_system_watertight_and_overlap_free_for_seamless_tileable_image(
     )
     assert report["overlap_free"] is True, (
         f"Schale und Kern ueberlappen ueber die App-UI: "
+        f"{report['overlap_volume_mm3']} mm3"
+    )
+
+
+def test_ejector_system_with_original_bugreport_image():
+    """Der wichtigste Regressionstest: das TATSAECHLICHE Bild aus dem
+    Bugreport (test_assets/puzzle_pattern_bugreport.png), einmal komplett
+    ueber die echte App-UI hochgeladen und mit dem Zwei-Teile-Auswerfer
+    erzeugt. Muss watertight sein und darf kein NaN-Ueberlappungsvolumen
+    liefern."""
+    at = AppTest.from_file("app.py")
+    at.run(timeout=APP_TIMEOUT)
+    at = _run_with_uploaded_image(at, _puzzle_pattern_bugreport_image_bytes())
+    assert not at.exception
+
+    at.checkbox(key="create_axis_hole").set_value(True)
+    at.checkbox(key="generate_ejector_system").set_value(True)
+    at.run(timeout=APP_TIMEOUT)
+
+    at.button(key="generate_button").click()
+    at.run(timeout=APP_TIMEOUT)
+
+    assert not at.exception, f"Unerwartete Exception: {at.exception}"
+    shell_mesh = at.session_state["shell_mesh"]
+    core_mesh = at.session_state["core_mesh"]
+    assert shell_mesh is not None and not shell_mesh.is_empty
+    assert core_mesh is not None and not core_mesh.is_empty
+    assert shell_mesh.is_watertight, "Schale ist beim Original-Bugreport-Bild nicht wasserdicht"
+    assert core_mesh.is_watertight, "Kern ist beim Original-Bugreport-Bild nicht wasserdicht"
+
+    report = at.session_state["ejector_report"]
+    assert report is not None
+    assert not np.isnan(report["overlap_volume_mm3"]), (
+        "Ueberlappungsvolumen ist NaN beim Original-Bugreport-Bild -- der "
+        "urspruenglich gemeldete Fehlerfall"
+    )
+    assert report["overlap_free"] is True, (
+        f"Schale und Kern ueberlappen beim Original-Bugreport-Bild: "
         f"{report['overlap_volume_mm3']} mm3"
     )
 
