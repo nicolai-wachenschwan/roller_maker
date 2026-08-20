@@ -471,6 +471,15 @@ with st.sidebar:
                  "jeder DPI-Einstellung druckbar bleiben.",
             key="ejector_bridge_width_mm",
         )
+        ejector_max_overhang = st.slider(
+            "Max. Überhangwinkel (Grad)", 30, 70, 45, 5,
+            help="Der Roller wird STEHEND gedruckt (Zylinderachse = "
+                 "Aufbaurichtung). Die Vorderkante der Kern-Stopfen wird auf "
+                 "diesen Winkel abgeschrägt, damit sie im geschlossenen Spalt "
+                 "ohne Stützmaterial druckt. Flacher = sicherer, aber die "
+                 "Stopfen erreichen erst später ihre volle Höhe.",
+            key="ejector_max_overhang",
+        )
         ejector_min_feature_mm = st.slider(
             "Kleinstes druckbares Detail (mm)", 0.0, 2.0, 0.8, 0.1,
             help="Muster-Details unterhalb dieser Groesse werden entfernt "
@@ -654,6 +663,7 @@ with col1:
                         axis_diameter_mm=axis_diameter,
                         bridge_width_mm=ejector_bridge_width_mm,
                         min_feature_mm=ejector_min_feature_mm,
+                        max_overhang_deg=float(ejector_max_overhang),
                         cut_through=True,
                     )
                     st.session_state.shell_mesh = shell_mesh
@@ -699,6 +709,13 @@ with col1:
                                     f"{ejector_report.get('hole_specks_filled', 0)} Mini-Löcher "
                                     f"gefüllt (nicht druckbare Details)."
                                 )
+                            ribs = ejector_report.get("support_ribs_added", 0)
+                            if ribs:
+                                st.info(
+                                    f"{ejector_report.get('floating_starts_found', 0)} Stelle(n) "
+                                    f"hätten beim Drucken in der Luft angefangen und wurden mit "
+                                    f"{ribs} senkrechten Stützrippe(n) abgefangen."
+                                )
                             for warning in ejector_report.get("warnings", []):
                                 st.warning(warning)
 
@@ -712,6 +729,13 @@ with col1:
                             with rep_col3:
                                 st.metric("Kernwand (Achse → Mantel)",
                                           f"{ejector_report.get('core_wall_thickness_mm', 0):.2f} mm")
+                            st.caption(
+                                "Druckrichtung: stehend, Zylinderachse = Aufbaurichtung. "
+                                f"Stopfen auf voller Höhe: "
+                                f"{ejector_report.get('plug_full_height_ratio', 0) * 100:.0f} % · "
+                                f"längste frei überbrückte Lochdecke: "
+                                f"{ejector_report.get('max_unsupported_span_mm', 0):.0f} mm"
+                            )
                             st.caption(
                                 f"Stopfen-Abdeckung der Lochfläche: "
                                 f"{ejector_report.get('plug_coverage', 0) * 100:.0f} % · "

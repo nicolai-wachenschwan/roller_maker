@@ -26,11 +26,20 @@ Radius r(theta, z). Der einzige Freiheitsgrad zwischen ihnen ist die
 RELATIVE ROTATION um die gemeinsame Achse -- niemals eine radiale
 Translation. Das hat zwei Konsequenzen:
 
-1. Innerhalb einer Druckschicht (konstantes z) aendert sich der Radius nur
-   in der Ebene (mit theta) -- es gibt nie einen Ueberhang in Z-Richtung,
-   also nie einen Bruecken-/Support-Bedarf im Spalt zwischen den Teilen.
+1. Der Spalt zwischen den Teilen ist ein senkrechter Ringspalt konstanter
+   Breite: beide Spaltwaende stehen lotrecht in der Aufbaurichtung und
+   brauchen fuer sich keine Stuetze.
 2. Beide Teile sind durchgehende Vollkoerper (Schale = Rohr, Kern =
    Vollzylinder mit Reliefmuster), keine freikragenden Finger.
+
+KORREKTUR einer frueheren Annahme: an dieser Stelle stand, innerhalb einer
+Druckschicht aendere sich der Radius nur mit theta, es gebe deshalb
+ueberhaupt keine Ueberhaenge. Das gilt nur fuer ein Muster, das sich in
+z-Richtung nicht aendert -- also fuer keines. Das Muster variiert mit z,
+und damit hat jeder Stopfen an seiner unteren Kante einen Ueberhang von gut
+2 mm, und zwar im geschlossenen Spalt, wo Stuetzmaterial nach dem Druck
+nicht mehr herauskommt. Gemessen waren das 69deg vom Lot (bei feinerem
+Raster noch mehr). Siehe Abschnitt "Druckrichtung" weiter unten.
 
 Der Kern traegt an der Ruheposition (relativer Winkel 0) exakt dieselbe
 Lochmaske wie die Schale (mit Erosions-Toleranz fuer Spiel) -- die
@@ -125,6 +134,34 @@ des Zylinders zwar topologisch verbinden, aber mechanisch nicht tragen.
 Das ist die einzige Stelle, an der bewusst MEHR als das topologische
 Minimum gebaut wird -- Topologie und Mechanik sind eben zwei verschiedene
 Anforderungen.
+
+Druckrichtung: Zylinderachse = Aufbaurichtung
+----------------------------------------------
+Beide Teile werden STEHEND gedruckt, print-in-place ineinander: die
+Zylinderachse liegt in der Aufbaurichtung, z=0 ist die Druckplatte. Eine
+Druckschicht ist damit genau eine Bildspalte. Diese Orientierung ist keine
+Empfehlung, sondern Voraussetzung -- liegend gedruckt waere der Ringspalt
+ein einziger, nicht entfernbarer Stuetzbereich.
+
+Aus dieser Festlegung folgen drei Anforderungen, die der Zusammenhang der
+Maske allein NICHT abdeckt:
+
+- KEIN START IN DER LUFT: eine Schicht-Komponente ohne Material darunter
+  faellt beim Drucken herunter -- auch dann, wenn die Maske als Ganzes
+  zusammenhaengt (sie kann ja von oben angebunden sein). Solche Stellen
+  bekommen eine senkrechte Stuetzrippe aus eigenem Material (Abschnitt 4c).
+- KEIN UEBERHANG IM SPALT: die Vorderkante jedes Kern-Stopfens wird auf
+  maximal 45deg abgeschraegt (limit_overhang_along_build_axis). Aussen an
+  der Schale wird NICHT abgeschraegt -- dort ist die Kontur das Produkt.
+- STEGE MOEGLICHST LAENGS: bei gleicher Laenge bevorzugt der Spannbaum
+  Stege in z-Richtung (senkrechte Rippen, drucken sich von selbst) vor
+  Stegen in theta-Richtung (waagerechte Bruecken, die zusaetzlich den
+  darunterliegenden Stopfen unterbrechen). Das steht als Aufschlag im
+  Kostenmass des Spannbaums, nicht als Sonderregel.
+
+Waagerechte Decken ueber den Loechern der Schale bleiben bewusst Bruecken:
+sie haengen im Freien und sind an beiden Enden angebunden -- das kann FDM.
+Ihre groesste Spannweite wird gemessen und gemeldet.
 
 Haltbarkeit: Wandstaerken statt Haut
 --------------------------------------
@@ -447,11 +484,28 @@ def find_material_components(hole_mask: np.ndarray):
 
 
 def _shortest_bridge_candidates(material: np.ndarray, labels: np.ndarray,
-                                 num: int):
+                                 num: int,
+                                 pixel_pitch_theta_mm: float = 1.0,
+                                 pixel_pitch_z_mm: float = 1.0,
+                                 across_build_penalty: float = 1.0):
     """Kuerzeste Verbindungskandidaten zwischen benachbarten Fragmenten.
 
-    Liefert eine Liste von (laenge, label_a, label_b, (r_a, c_a), (r_b, c_b)),
-    je Fragmentpaar nur den kuerzesten Kandidaten.
+    Liefert eine Liste von (gewicht, label_a, label_b, (r_a, c_a), (r_b, c_b)),
+    je Fragmentpaar nur den guenstigsten Kandidaten.
+
+    Das Gewicht ist NICHT die Pixeldistanz, sondern:
+
+      * die tatsaechliche Steglaenge in MILLIMETERN -- ein Pixel ist in
+        theta- und z-Richtung verschieden gross, ein Spannbaum ueber
+        Pixeldistanzen wuerde also die falschen Stege waehlen;
+      * multipliziert mit einem Aufschlag fuer Stege, die QUER zur
+        Aufbaurichtung laufen. Ein Steg entlang z ist eine senkrechte Rippe
+        und druckt sich von selbst; ein Steg entlang theta ist eine
+        waagerechte Bruecke, die frei ueberspannt werden muss und ausserdem
+        den darunterliegenden Stopfen unterbricht (was innen einen
+        Ueberhang erzeugt). Bei gleicher Laenge nimmt der Spannbaum damit
+        die druckbarere Variante -- ohne dass dafuer eine Sonderregel
+        noetig waere: es steht einfach im Kostenmass.
 
     Die Analyse laeuft auf einer in theta dreifach gekachelten Kopie, damit
     Verbindungen ueber die Naht theta=0 <-> theta=ny-1 genauso gefunden
@@ -497,8 +551,7 @@ def _shortest_bridge_candidates(material: np.ndarray, labels: np.ndarray,
             continue
         r0, c0, r1, c1 = r0[sel], c0[sel], r1[sel], c1[sel]
         o0, o1 = o0[sel], o1[sel]
-        w = dist[r0, c0] + dist[r1, c1] + 1.0
-        w_all.append(w)
+        w_all.append(np.zeros(r0.shape, dtype=float))  # spaeter aus den Endpunkten
         a_all.append(np.minimum(o0, o1))
         b_all.append(np.maximum(o0, o1))
         # Endpunkte: die jeweils naechsten Materialpixel der beiden Seiten,
@@ -514,11 +567,21 @@ def _shortest_bridge_candidates(material: np.ndarray, labels: np.ndarray,
     if not w_all:
         return []
 
-    w = np.concatenate(w_all)
     a = np.concatenate(a_all).astype(np.int64)
     b = np.concatenate(b_all).astype(np.int64)
     ra, ca = np.concatenate(ra_all), np.concatenate(ca_all)
     rb, cb = np.concatenate(rb_all), np.concatenate(cb_all)
+
+    # Gewicht aus den tatsaechlichen Endpunkten: Laenge in mm, Aufschlag fuer
+    # Stege quer zur Aufbaurichtung.
+    d_theta_px = np.abs(ra - rb).astype(float)
+    d_theta_px = np.minimum(d_theta_px, ny - d_theta_px)   # kuerzerer Weg um den Umfang
+    d_z_px = np.abs(ca - cb).astype(float)
+    d_theta_mm = d_theta_px * pixel_pitch_theta_mm
+    d_z_mm = d_z_px * pixel_pitch_z_mm
+    length_mm = np.hypot(d_theta_mm, d_z_mm)
+    across = d_theta_mm / np.maximum(d_theta_mm + d_z_mm, 1e-9)
+    w = length_mm * (1.0 + across_build_penalty * across)
 
     # je Fragmentpaar den kuerzesten Kandidaten behalten
     key = a * (num + 1) + b
@@ -542,7 +605,11 @@ def _shortest_bridge_candidates(material: np.ndarray, labels: np.ndarray,
 def connect_material_components(hole_mask: np.ndarray,
                                  bridge_width_px: int = 2,
                                  bridge_width_z_px: int | None = None,
-                                 max_rounds: int = 3) -> tuple[np.ndarray, dict]:
+                                 max_rounds: int = 3,
+                                 pixel_pitch_theta_mm: float = 1.0,
+                                 pixel_pitch_z_mm: float = 1.0,
+                                 across_build_penalty: float = 1.0
+                                 ) -> tuple[np.ndarray, dict]:
     """Verbindet ALLE Materialfragmente zu genau einem Koerper -- ueber einen
     minimalen Spannbaum der kuerzest moeglichen Stege (siehe Konzept oben).
 
@@ -581,7 +648,12 @@ def connect_material_components(hole_mask: np.ndarray,
     for _ in range(max_rounds):
         info["rounds"] += 1
         material = ~repaired
-        candidates = _shortest_bridge_candidates(material, labels, num)
+        candidates = _shortest_bridge_candidates(
+            material, labels, num,
+            pixel_pitch_theta_mm=pixel_pitch_theta_mm,
+            pixel_pitch_z_mm=pixel_pitch_z_mm,
+            across_build_penalty=across_build_penalty,
+        )
         if not candidates:
             break
 
@@ -595,9 +667,10 @@ def connect_material_components(hole_mask: np.ndarray,
             uf.union(a, b)
             for r, c in _bridge_path(pa[0], pa[1], pb[0], pb[1], ny):
                 path_canvas[r % ny, c] = True
+            d_theta = min(abs(pa[0] - pb[0]), ny - abs(pa[0] - pb[0]))
             info["bridges"].append({
-                "from": a, "to": b, "length_px": length,
-                "at": (pa, pb),
+                "from": a, "to": b, "weight": length, "at": (pa, pb),
+                "runs_across_build": d_theta > abs(pa[1] - pb[1]),
             })
 
         repaired[_dilate_bridges(path_canvas, w_theta, w_z)] = False
@@ -610,6 +683,145 @@ def connect_material_components(hole_mask: np.ndarray,
     info["connected"] = num == 1
     info["bridge_pixels_added"] = int((~repaired).sum() - before_material)
     return repaired, info
+
+
+# ---------------------------------------------------------------------------
+# 4c. Druckrichtung: nichts darf in der Luft anfangen
+# ---------------------------------------------------------------------------
+#
+# Zusammenhang ist NICHT dasselbe wie Druckbarkeit. Die Maske kann ein
+# einziger Koerper sein und trotzdem Material enthalten, das beim Drucken in
+# der Luft beginnt: die Zylinderachse ist die Aufbaurichtung, eine Druck-
+# schicht ist also EINE Bildspalte (ein z-Wert), und ein Muster-Detail, das
+# von oben in ein Lochfeld hineinragt (eine "Stalaktiten"-Zunge), hat an
+# seiner untersten Schicht nichts unter sich. Es faellt beim Drucken herunter.
+#
+# Kriterium (schichtweise von der Druckplatte nach oben):
+#
+#     Jede Zusammenhangskomponente EINER Schicht muss mindestens ein Pixel
+#     haben, unter dem in der Schicht darunter Material steht.
+#
+# Waagerechte Decken ueber einem Loch sind dagegen ausdruecklich erlaubt und
+# werden NICHT verstuetzt: sie sind an beiden theta-Enden in derselben
+# Schicht angebunden, also eine gewoehnliche Bruecke im Freien -- genau das,
+# wofuer FDM Bruecken-Kuehlung hat. Sie zu "reparieren" wuerde das
+# Schnittmuster ohne Not verfaelschen.
+#
+# Der Fix ist derselbe Gedanke wie beim Spannbaum, nur entlang der
+# Aufbaurichtung: die schwebende Komponente bekommt eine senkrechte Rippe
+# aus eigenem Material bis zum naechsten tragenden Punkt darunter -- die
+# kuerzeste, die es gibt. Stuetzmaterial waere hier keine Option: im Spalt
+# zwischen Schale und Kern liesse es sich nach dem Druck nicht entfernen.
+
+
+def _support_offset_px(pixel_pitch_theta_mm: float, pixel_pitch_z_mm: float,
+                        max_overhang_deg: float) -> int:
+    """Wie weit darf eine Schicht gegenueber der darunterliegenden seitlich
+    versetzt sein und gilt trotzdem als getragen? Genau so weit, wie der
+    zulaessige Ueberhangwinkel es hergibt."""
+    if pixel_pitch_theta_mm <= 0:
+        return 0
+    reach_mm = np.tan(np.radians(max_overhang_deg)) * pixel_pitch_z_mm
+    return int(np.floor(reach_mm / pixel_pitch_theta_mm))
+
+
+def find_floating_layer_starts(hole_mask: np.ndarray, support_offset_px: int = 0
+                                ) -> list[dict]:
+    """Findet Schicht-Komponenten, die beim Drucken in der Luft anfangen."""
+    material = ~hole_mask
+    ny, nx = material.shape
+    floating = []
+    for z in range(1, nx):
+        column = material[:, z]
+        if not column.any():
+            continue
+        supported_below = material[:, z - 1]
+        if support_offset_px > 0:
+            supported_below = ndimage.binary_dilation(
+                np.pad(supported_below, support_offset_px, mode="wrap"),
+                structure=np.ones(2 * support_offset_px + 1, dtype=bool),
+            )[support_offset_px:support_offset_px + ny]
+        labels, num = label_periodic_theta(column[:, None])
+        for lbl in range(1, num + 1):
+            rows = np.where(labels[:, 0] == lbl)[0]
+            if not supported_below[rows].any():
+                floating.append({"z": z, "rows": rows, "size": int(rows.size)})
+    return floating
+
+
+def add_support_ribs(hole_mask: np.ndarray, support_offset_px: int = 0,
+                      rib_width_px: int = 2) -> tuple[np.ndarray, dict]:
+    """Stuetzt jede in der Luft beginnende Schicht-Komponente mit einer
+    senkrechten Rippe aus eigenem Material ab.
+
+    Von unten nach oben abgearbeitet, damit eine gerade gesetzte Rippe die
+    darueberliegenden Schichten sofort mittraegt -- eine Rippe kann so
+    mehrere schwebende Starts auf einmal erledigen.
+    """
+    info = {"floating_starts_found": 0, "support_ribs_added": 0,
+            "support_rib_pixels": 0}
+    working = hole_mask.copy()
+    ny, nx = working.shape
+    half = max(0, (max(1, rib_width_px) - 1) // 2)
+    before = (~working).sum()
+
+    for z in range(1, nx):
+        material = ~working
+        column = material[:, z]
+        if not column.any():
+            continue
+        supported_below = material[:, z - 1]
+        if support_offset_px > 0:
+            supported_below = ndimage.binary_dilation(
+                np.pad(supported_below, support_offset_px, mode="wrap"),
+                structure=np.ones(2 * support_offset_px + 1, dtype=bool),
+            )[support_offset_px:support_offset_px + ny]
+
+        labels, num = label_periodic_theta(column[:, None])
+        for lbl in range(1, num + 1):
+            rows = np.where(labels[:, 0] == lbl)[0]
+            if supported_below[rows].any():
+                continue
+            info["floating_starts_found"] += 1
+
+            # Kuerzeste Rippe: fuer jede theta-Zeile der Komponente den
+            # naechstgelegenen tragenden Punkt WEITER UNTEN suchen.
+            best = None
+            for r in rows:
+                below = np.where(material[r, :z])[0]
+                start = int(below[-1]) if below.size else 0
+                drop = z - start
+                if best is None or drop < best[1]:
+                    best = (int(r), drop, start)
+            r, _, start = best
+            for zz in range(start, z + 1):
+                for d in range(-half, half + 1):
+                    working[(r + d) % ny, zz] = False
+            info["support_ribs_added"] += 1
+
+    info["support_rib_pixels"] = int((~working).sum() - before)
+    return working, info
+
+
+def max_unsupported_span_px(hole_mask: np.ndarray) -> int:
+    """Laengste waagerechte Bruecke, die beim Drucken frei ueberspannt wird:
+    der breiteste Loch-Abschnitt (in theta), ueber dem in der Schicht darueber
+    wieder Material steht. Nur eine Diagnose -- gebrueckt wird bewusst, nicht
+    verstuetzt."""
+    material = ~hole_mask
+    ny, nx = material.shape
+    longest = 0
+    for z in range(1, nx):
+        gap = (~material[:, z - 1]) & material[:, z]   # Decke ueber einem Loch
+        if not gap.any():
+            continue
+        holes_below = ~material[:, z - 1]
+        labels, num = label_periodic_theta(holes_below[:, None], connectivity=2)
+        for lbl in range(1, num + 1):
+            rows = np.where(labels[:, 0] == lbl)[0]
+            if gap[rows].any():
+                longest = max(longest, int(rows.size))
+    return longest
 
 
 # ---------------------------------------------------------------------------
@@ -753,6 +965,8 @@ def repair_cut_mask(hole_mask: np.ndarray, bridge_width_px: int = 2,
                      pixel_pitch_z_mm: float | None = None,
                      bridge_width_mm: float | None = None,
                      min_feature_mm: float | None = None,
+                     max_overhang_deg: float = 45.0,
+                     across_build_penalty: float = 1.0,
                      ) -> tuple[np.ndarray, dict]:
     """Macht aus einer beliebigen Lochmaske eine druckbare Lochmaske.
 
@@ -765,6 +979,8 @@ def repair_cut_mask(hole_mask: np.ndarray, bridge_width_px: int = 2,
          einem einzigen duennen Steg haengt.
       3. Allgemeine Verbindungsstrategie: minimaler Spannbaum ueber alle
          Materialfragmente -> genau ein zusammenhaengender Koerper.
+      4. Druckrichtung: was beim Drucken in der Luft anfinge, bekommt eine
+         senkrechte Stuetzrippe aus eigenem Material (Abschnitt 4c).
 
     Sind die Pixelteilungen bekannt, werden Stegbreite und Mindest-Feature
     in MILLIMETERN bemessen (und pro Achse getrennt in Pixel umgerechnet) --
@@ -811,13 +1027,35 @@ def repair_cut_mask(hole_mask: np.ndarray, bridge_width_px: int = 2,
 
     # -- 3. Spannbaum --
     working, connect_info = connect_material_components(
-        working, bridge_width_px=bridge_theta_px, bridge_width_z_px=bridge_z_px
+        working, bridge_width_px=bridge_theta_px, bridge_width_z_px=bridge_z_px,
+        pixel_pitch_theta_mm=pixel_pitch_theta_mm or 1.0,
+        pixel_pitch_z_mm=pixel_pitch_z_mm or 1.0,
+        across_build_penalty=across_build_penalty,
     )
     report["components_found"] = connect_info["components_before"]
     report["bridges_added"] = len(connect_info["bridges"])
     report["bridge_pixels_added"] = connect_info["bridge_pixels_added"]
     report["single_body"] = connect_info["connected"]
     report["components_remaining"] = connect_info["components_after"]
+    report["bridges_across_build_direction"] = sum(
+        1 for b in connect_info["bridges"] if b["runs_across_build"]
+    )
+
+    # -- 4. Druckrichtung: nichts darf in der Luft anfangen --
+    support_offset = _support_offset_px(
+        pixel_pitch_theta_mm or 1.0, pixel_pitch_z_mm or 1.0, max_overhang_deg
+    )
+    working, support_info = add_support_ribs(
+        working, support_offset_px=support_offset, rib_width_px=bridge_theta_px
+    )
+    report.update(support_info)
+    report["remaining_floating_starts"] = len(
+        find_floating_layer_starts(working, support_offset)
+    )
+    span_px = max_unsupported_span_px(working)
+    report["max_unsupported_span_px"] = span_px
+    if pixel_pitch_theta_mm:
+        report["max_unsupported_span_mm"] = span_px * pixel_pitch_theta_mm
 
     # Sicherheits-Check: nach der Reparatur darf nichts mehr uebrig sein.
     remaining_islands, _ = find_material_islands(working)
@@ -867,6 +1105,40 @@ def _plug_mask_for_clearance(hole_mask: np.ndarray, clearance_mm: float,
     # dort grenzt kein Schalenmaterial an, der Stopfen darf stehen bleiben.
     eroded = ndimage.binary_erosion(padded, structure=struct, border_value=1)
     return eroded[er_theta:er_theta + hole_mask.shape[0], :]
+
+
+def limit_overhang_along_build_axis(radius_field: np.ndarray, dz_mm: float,
+                                     max_overhang_deg: float = 45.0
+                                     ) -> np.ndarray:
+    """Begrenzt, wie schnell der Radius ENTLANG DER AUFBAURICHTUNG wachsen
+    darf -- aus einer waagerechten Kragplatte wird damit eine selbsttragende
+    Schraege.
+
+    Warum das gerade beim Kern noetig ist: ein Stopfen ragt um
+    (Wandstaerke + Spiel - Buendigversatz), also gut 2 mm, ueber den
+    Kernmantel hinaus. An seiner unteren Kante entstuende ohne diese
+    Begrenzung ein waagerechter Kragarm von 2 mm -- und zwar INNEN, im
+    Spalt zwischen Kern und Schale. Stuetzmaterial waere dort nach dem Druck
+    nicht mehr zu entfernen (der Spalt ist geschlossen), also muss die
+    Geometrie selbst stuetzfrei sein.
+
+    Das Feld wird dabei ausschliesslich ABGESENKT, nie angehoben -- die
+    radiale Zonierung und damit die Kollisionsfreiheit zwischen Schale und
+    Kern bleibt unangetastet.
+
+    Auf die SCHALE wird das bewusst nicht angewendet: ihre Aussenkontur IST
+    das Schnittmuster. Eine Fase an jeder Lochdecke wuerde die Schnittkante
+    um gut 2 mm in z verschieben und damit das Muster verfaelschen. Die
+    Lochdecken sind Bruecken im Freien, an beiden Enden angebunden -- die
+    druckt FDM ohne Stuetze.
+    """
+    if max_overhang_deg >= 90 or radius_field.shape[1] < 2:
+        return radius_field
+    max_rise = np.tan(np.radians(max_overhang_deg)) * dz_mm
+    limited = radius_field.copy()
+    for k in range(1, limited.shape[1]):
+        np.minimum(limited[:, k], limited[:, k - 1] + max_rise, out=limited[:, k])
+    return limited
 
 
 def _vertices_from_radius_field(radius_field: np.ndarray, radius_mm: float,
@@ -1041,6 +1313,7 @@ def build_dual_cylinder(
     min_core_wall_mm: float = 2.0,
     bridge_width_mm: float = 1.0,
     min_feature_mm: float = 0.8,
+    max_overhang_deg: float = 45.0,
 ) -> tuple[trimesh.Trimesh, trimesh.Trimesh, dict]:
     """Erzeugt Schale (Rohr mit Loechern) und Kern (Vollzylinder mit
     Stopfen) fuer das Rotations-Auswerfer-Konzept.
@@ -1083,6 +1356,7 @@ def build_dual_cylinder(
         pixel_pitch_z_mm=pitch_z_mm,
         bridge_width_mm=bridge_width_mm,
         min_feature_mm=min_feature_mm,
+        max_overhang_deg=max_overhang_deg,
     )
 
     r_out = float(radius_mm)
@@ -1136,6 +1410,16 @@ def build_dual_cylinder(
         repaired_mask, radial_clearance_mm, pixel_pitch_theta_mm, pixel_pitch_z_mm
     )
     core_field = np.where(plug_mask, r_plug, r_core)
+    # Stuetzfrei drucken: die Vorderkante jedes Stopfens wird zur Schraege,
+    # statt als waagerechter Kragarm in den geschlossenen Spalt zu ragen.
+    limited_core_field = limit_overhang_along_build_axis(
+        core_field, pixel_pitch_z_mm, max_overhang_deg
+    )
+    plug_px = int(plug_mask.sum())
+    full_height_px = int((limited_core_field >= r_plug - 1e-9).sum())
+    report["plug_full_height_ratio"] = (full_height_px / plug_px) if plug_px else 0.0
+    report["max_overhang_deg"] = max_overhang_deg
+    core_field = limited_core_field
     core_vertices = _vertices_from_radius_field(core_field, r_out, height_mm)
     core_mesh = _finish_mesh(core_vertices, ny, nx)
 
@@ -1186,6 +1470,26 @@ def build_dual_cylinder(
     # die schmaler sind als das doppelte Bewegungsspiel, bleiben ohne Stopfen
     # und damit ohne Auswurfwirkung.
     report["plug_coverage"] = (report["plug_pixels"] / hole_px) if hole_px else 0.0
+    if plug_px and report["plug_full_height_ratio"] < 0.5:
+        warnings.append(
+            f"Nur {report['plug_full_height_ratio'] * 100:.0f} % der Stopfenflaeche "
+            f"erreichen ihre volle Hoehe -- die Muster-Details sind in "
+            f"Achsrichtung kuerzer als die stuetzfreie Anlauframpe "
+            f"({max_overhang_deg:.0f}deg). Groesseres Muster oder geringere "
+            f"Stopfenhoehe waehlen."
+        )
+    if report.get("remaining_floating_starts", 0):
+        warnings.append(
+            f"{report['remaining_floating_starts']} Stelle(n) beginnen beim "
+            f"Drucken weiterhin in der Luft."
+        )
+    span_mm = report.get("max_unsupported_span_mm")
+    if span_mm and span_mm > 20.0:
+        warnings.append(
+            f"Groesste frei zu ueberbrueckende Lochdecke: {span_mm:.0f} mm. "
+            f"Ab etwa 20 mm haengt eine FDM-Bruecke sichtbar durch -- Muster "
+            f"feiner waehlen oder Loecher in Achsrichtung ausrichten."
+        )
     if hole_px and report["plug_coverage"] < 0.5:
         warnings.append(
             f"Nur {report['plug_coverage'] * 100:.0f} % der Lochflaeche bekommen "
@@ -1489,6 +1793,126 @@ def _test_plug_coverage_is_reported_for_fine_patterns():
         f"PASS: Zu feines Muster wird gemeldet "
         f"(Stopfen-Abdeckung {report['plug_coverage'] * 100:.0f} %)"
     )
+
+
+def _test_nothing_starts_in_mid_air():
+    """Druckrichtung: die Maske kann EIN zusammenhaengender Koerper sein und
+    trotzdem Material enthalten, das beim Drucken in der Luft beginnt -- eine
+    Zunge, die von oben in ein Lochfeld haengt, ist ueber ihr oberes Ende
+    angebunden, hat an ihrer untersten Schicht aber nichts unter sich."""
+    ny, nx = 60, 40
+    hole = np.zeros((ny, nx), dtype=bool)
+    hole[10:50, 5:25] = True      # Lochfeld
+    hole[25:35, 15:25] = False    # Zunge, nur am oberen (z-hoeheren) Ende
+                                  # angebunden -- unten haengt sie in der Luft
+
+    _, num = find_material_components(hole)
+    assert num == 1, f"Testfall soll zusammenhaengend sein, ist aber {num}-teilig"
+    floating = find_floating_layer_starts(hole)
+    assert len(floating) >= 1, "Testfall enthaelt keinen schwebenden Start"
+
+    repaired, report = repair_cut_mask(hole)
+    assert report["floating_starts_found"] >= 1
+    assert report["remaining_floating_starts"] == 0, (
+        "Es faengt weiterhin Material in der Luft an"
+    )
+    assert report["support_ribs_added"] >= 1
+    print(
+        f"PASS: {report['floating_starts_found']} schwebende(r) Schichtstart(s) "
+        f"mit {report['support_ribs_added']} senkrechten Rippe(n) abgestuetzt"
+    )
+
+
+def _test_hole_ceilings_stay_bridges():
+    """Gegenprobe: eine waagerechte Decke ueber einem Loch ist an beiden
+    theta-Enden in derselben Schicht angebunden -- eine gewoehnliche Bruecke.
+    Die darf NICHT 'repariert' werden, sonst verfaelscht man das
+    Schnittmuster ohne Not."""
+    ny, nx = 60, 40
+    hole = np.zeros((ny, nx), dtype=bool)
+    hole[20:30, 15:25] = True     # normales Loch mitten in der Wand
+
+    repaired, report = repair_cut_mask(hole)
+    assert report["floating_starts_found"] == 0, (
+        "Lochdecke wurde faelschlich als schwebender Start behandelt"
+    )
+    assert np.array_equal(repaired, hole), (
+        "Muster wurde veraendert, obwohl nichts zu reparieren war"
+    )
+    assert report["max_unsupported_span_px"] == 10, (
+        f"Spannweite falsch gemessen: {report['max_unsupported_span_px']}"
+    )
+    print("PASS: Lochdecken bleiben Bruecken und werden nicht angetastet")
+
+
+def _test_plug_leading_edge_is_self_supporting():
+    """Der Stopfen ragt gut 2 mm ueber den Kernmantel hinaus -- an seiner
+    unteren Kante waere das ein waagerechter Kragarm INNEN im geschlossenen
+    Spalt, wo Stuetzmaterial nach dem Druck nicht mehr herauskommt. Die
+    Vorderkante muss deshalb eine selbsttragende Schraege sein."""
+    ny, nx = 60, 48
+    hole = np.zeros((ny, nx), dtype=bool)
+    hole[20:40, 16:32] = True
+
+    radius, height = 25.0, 40.0
+    max_overhang = 45.0
+    _, core, report = build_dual_cylinder(
+        hole, radius_mm=radius, height_mm=height, wall_thickness_mm=2.0,
+        radial_clearance_mm=0.4, flush_offset_mm=0.2, axis_diameter_mm=None,
+        cut_through=False, verify_no_overlap=False,
+        max_overhang_deg=max_overhang,
+    )
+    dz = height / (nx - 1)
+    radii = np.linalg.norm(core.vertices[:, :2], axis=1).reshape(ny, nx)
+    steepest_rise = float(np.diff(radii, axis=1).max())
+    angle = np.degrees(np.arctan(steepest_rise / dz))
+    assert angle <= max_overhang + 1e-6, (
+        f"Steilster Anstieg entlang der Aufbaurichtung: {angle:.0f}deg "
+        f"(erlaubt {max_overhang:.0f}deg) -- der Stopfen kragt frei aus"
+    )
+    assert report["plug_full_height_ratio"] > 0.5
+    print(
+        f"PASS: Stopfen-Vorderkante ist mit {angle:.0f}deg selbsttragend "
+        f"({report['plug_full_height_ratio'] * 100:.0f} % der Stopfenflaeche "
+        f"auf voller Hoehe)"
+    )
+
+
+def _test_overhang_limit_never_raises_the_core():
+    """Die Ueberhangbegrenzung darf das Radiusfeld nur ABSENKEN -- sonst
+    waere die Kollisionsfreiheit zwischen Kern und Schale nicht mehr
+    garantiert."""
+    rng = np.random.default_rng(4)
+    field = rng.uniform(10.0, 25.0, size=(30, 40))
+    limited = limit_overhang_along_build_axis(field, dz_mm=0.5,
+                                              max_overhang_deg=45.0)
+    assert (limited <= field + 1e-12).all(), "Feld wurde stellenweise angehoben"
+    rise = np.diff(limited, axis=1).max()
+    assert rise <= 0.5 + 1e-9, f"Anstieg {rise} ueberschreitet die Grenze"
+    print("PASS: Ueberhangbegrenzung senkt nur ab und haelt die Grenze ein")
+
+
+def _test_spanning_tree_prefers_bridges_along_the_build_direction():
+    """Bei vergleichbarer Laenge soll der Spannbaum den Steg waehlen, der in
+    Aufbaurichtung laeuft (senkrechte Rippe) statt quer dazu (waagerechte
+    Bruecke, die zusaetzlich den Stopfen darunter unterbricht)."""
+    ny, nx = 60, 60
+    hole = np.zeros((ny, nx), dtype=bool)
+    hole[10:50, 10:50] = True
+    hole[26:34, 26:34] = False      # eingeschlossenes Segment in der Mitte
+    # gleich weit entfernt in beide Richtungen -> die Wahl haengt nur am
+    # Kostenmass, nicht an der Geometrie
+
+    repaired, report = repair_cut_mask(
+        hole, pixel_pitch_theta_mm=0.2, pixel_pitch_z_mm=0.2,
+        bridge_width_mm=0.4, min_feature_mm=0.0, across_build_penalty=1.0,
+    )
+    assert report["single_body"]
+    assert report["bridges_across_build_direction"] == 0, (
+        "Spannbaum hat einen Quersteg gewaehlt, obwohl ein laengsgerichteter "
+        "genauso kurz gewesen waere"
+    )
+    print("PASS: Spannbaum bevorzugt Stege in Aufbaurichtung")
 
 
 def _test_boundary_touching_line_is_not_an_island():
@@ -1857,6 +2281,11 @@ def run_self_tests():
     _test_unprintable_specks_are_removed_instead_of_bridged()
     _test_degenerate_masks_are_reported_not_silently_built()
     _test_plug_coverage_is_reported_for_fine_patterns()
+    _test_nothing_starts_in_mid_air()
+    _test_hole_ceilings_stay_bridges()
+    _test_plug_leading_edge_is_self_supporting()
+    _test_overhang_limit_never_raises_the_core()
+    _test_spanning_tree_prefers_bridges_along_the_build_direction()
     _test_boundary_touching_line_is_not_an_island()
     _test_severing_ring_is_detected_and_fixed()
     _test_wraparound_seam_is_one_component()
