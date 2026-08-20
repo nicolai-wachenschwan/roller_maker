@@ -44,29 +44,62 @@ Loch. Das funktioniert fuer beliebige, unregelmaessige Bildmuster.
 
 Der eigentliche Teufel im Detail: Masken-Topologie
 ----------------------------------------------------
-Ein aus einem Bild per Schwellwert gewonnenes "Loch"-Muster kann zwei
-Arten von strukturellen Fallen enthalten, die eine gedruckte Schale
-zerstoeren wuerden:
+Ein aus einem Bild per Schwellwert gewonnenes "Loch"-Muster kann die
+gedruckte Schale in mehrere Teile zerfallen lassen. Statt einzelner
+Symptome ("Insel", "Trennring") gilt hier eine einzige, exakte Bedingung:
+
+    Die Materialmaske muss GENAU EINE zusammenhaengende Komponente
+    bilden (8er-Nachbarschaft, theta-Achse periodisch).
+
+Alles andere sind Spezialfaelle davon:
 
 - INSELN: ein Materialbereich, der vollstaendig von Loechern umgeben ist
-  und weder den oberen noch den unteren Bildrand beruehrt (z.B. der
-  Punkt ueber einem "i"). Ein solches Fragment haengt nach dem Schneiden
-  in der Luft -- es faellt heraus bzw. lässt sich gar nicht erst drucken.
-- TRENN-RINGE: eine Bildspalte (= eine z-Schicht = ein voller Umlauf),
-  bei der ALLE Theta-Werte als "Loch" markiert sind. Das zerschneidet die
-  Schale komplett in zwei unabhaengige Ringe (oben/unten), die nur noch
-  ueber die Stirn-Kappen zusammenhaengen wuerden -- meist gar nicht.
+  (z.B. das Innere eines Puzzleteils oder der Punkt ueber einem "i") --
+  er faellt nach dem Schneiden heraus. Solche Segmente koennen beliebig
+  tief verschachtelt sein (Zelle in Zelle in Zelle).
+- TRENN-RINGE: eine Bildspalte (= eine z-Schicht = ein voller Umlauf), bei
+  der ALLE Theta-Werte "Loch" sind. Das zerschneidet die Schale in zwei
+  unabhaengige Ringe.
+- GESCHLOSSENE SCHLEIFEN UM DEN UMFANG: eine wellenfoermige Schnittlinie,
+  die einmal um den Zylinder laeuft und sich selbst schliesst. Sie trennt
+  die Schale genauso in zwei Teile -- ohne dass eine einzige Bildspalte
+  komplett Loch waere und ohne dass eines der Teile "freischwebend"
+  aussieht. Eine Regel wie "Insel = beruehrt keinen Bildrand" uebersieht
+  diesen Fall vollstaendig.
 
-Randberuehrende Linien ("Linien nach unten", die den oberen oder unteren
-Bildrand erreichen) sind dagegen UNKRITISCH: sie sind ueber die
-Stirnkappe des Zylinders verankert, genau wie ein Steg, der bis zum
-Rand eines Stickmuster laeuft. Sie duerfen nicht faelschlich als Insel
-markiert werden.
+Die allgemeine Verbindungsstrategie
+------------------------------------
+Fuer alle diese Faelle wird dieselbe Strategie benutzt (Abschnitt 4):
 
-Dieses Modul erkennt beide Fallen (mit korrekter Beruecksichtigung des
-Umlaufs in Theta-Richtung -- der Bildrand links/rechts ist periodisch!)
-und repariert sie automatisch durch minimale Materialstege, bevor daraus
-eine Geometrie erzeugt wird.
+  1. Jedes Materialfragment ist ein Knoten eines Graphen.
+  2. Zwischen benachbarten Fragmenten liegt eine Kante mit dem Gewicht des
+     KUERZEST MOEGLICHEN Stegs zwischen ihnen. Die Kandidaten liefert die
+     Feature-Transformation der Distanztransformation: an der
+     "Wasserscheide" zweier Fragmente stossen Loch-Pixel aneinander, deren
+     jeweils naechstes Material zu verschiedenen Fragmenten gehoert.
+  3. Ein MINIMALER SPANNBAUM (Kruskal) waehlt daraus genau die Stege aus,
+     die noetig sind, um alles zu einem Koerper zu verbinden -- die
+     insgesamt kuerzesten, also mit dem geringstmoeglichen Eingriff ins
+     Schnittmuster und ohne einen einzigen ueberfluessigen Steg.
+
+Weil verschachtelte Fragmente so an ihren direkten NACHBARN haengen (und
+nicht einzeln quer durch das ganze Muster zu einem "verankerten" Bereich
+gezogen werden), skaliert das auch fuer Muster mit hunderten
+eingeschlossenen Segmenten.
+
+Ein voller Umlauf-Schnitt bekommt zusaetzlich mehrere, ueber den Umfang
+verteilte Stege: ein einzelner minimaler Steg wuerde die beiden Haelften
+des Zylinders zwar topologisch verbinden, aber mechanisch nicht tragen.
+
+Haltbarkeit: Wandstaerken statt Haut
+--------------------------------------
+Die Schale ist ein Rohr mit ueberall voller Wandstaerke, in dem die
+Loecher durchgehen; der Kern ist ein VOLLZYLINDER, aus dem nur die
+Achsbohrung entfernt wird. Die Kollisionsfreiheit ergibt sich aus der
+festen Radienstaffelung (Abschnitt 6) und der seitlichen Erosion der
+Stopfen -- nicht aus einem musterfoermigen Boolean-Ausschnitt, der
+frueher auch unter der Schneidenwand Material weggenommen und beide Teile
+duennwandig gemacht hat.
 """
 
 from __future__ import annotations
@@ -167,35 +200,303 @@ def find_severing_rings(hole_mask: np.ndarray) -> list[int]:
     return [j for j in range(nx) if np.all(hole_mask[:, j])]
 
 
+def _group_consecutive(cols: list[int]) -> list[list[int]]:
+    """Aufeinanderfolgende Spaltenindizes zu Baendern gruppieren."""
+    runs: list[list[int]] = []
+    for c in sorted(cols):
+        if runs and c == runs[-1][-1] + 1:
+            runs[-1].append(c)
+        else:
+            runs.append([c])
+    return runs
+
+
 def fix_severing_rings(hole_mask: np.ndarray, severing_cols: list[int],
                         tab_width_px: int = 3, n_tabs: int = 2) -> np.ndarray:
-    """Setzt an jeder Trenn-Spalte n_tabs schmale Materialstege (mask=False),
-    gleichmaessig ueber den Umfang verteilt, um die Schale zusammenzuhalten."""
+    """Legt ueber jedes Trenn-Band n_tabs schmale Materialstege (mask=False).
+
+    Die Stege sind eine STRUKTURELLE VERSTAERKUNG, keine reine Topologie-
+    Reparatur: die allgemeine Verbindungsstrategie (Abschnitt 4) wuerde die
+    beiden Ringhaelften mit einem einzigen minimalen Steg verbinden -- fuer
+    einen vollen Umlauf-Schnitt, der das Bauteil sonst in zwei Haelften
+    zerlegt, ist ein einzelner Steg mechanisch zu schwach. Deshalb werden
+    hier mehrere, ueber den Umfang verteilte Stege gesetzt.
+
+    Die Winkelpositionen werden dabei am Muster ausgerichtet: bevorzugt
+    liegen die Stege dort, wo links und rechts vom Trenn-Band ohnehin
+    Material steht (dann verbindet der Steg tatsaechlich zwei tragende
+    Bereiche und zerstoert moeglichst wenig vom Schnittmuster).
+    """
     repaired = hole_mask.copy()
     ny, nx = hole_mask.shape
-    if ny == 0:
+    if ny == 0 or not severing_cols:
         return repaired
+
+    material = ~hole_mask
     half = tab_width_px // 2
-    for col in severing_cols:
-        for k in range(n_tabs):
-            center = int(round(k * ny / n_tabs))
-            for d in range(-half, half + 1):
-                repaired[(center + d) % ny, col] = False
+    min_sep = max(1, ny // (2 * max(n_tabs, 1)))
+
+    for run in _group_consecutive(severing_cols):
+        left, right = run[0] - 1, run[-1] + 1
+        # Wie viel Material steht direkt links/rechts neben dem Trenn-Band?
+        score = np.zeros(ny, dtype=float)
+        if left >= 0:
+            score += material[:, left].astype(float)
+        if right < nx:
+            score += material[:, right].astype(float)
+        # leicht glaetten, damit ein Steg in der MITTE eines Materialbereichs
+        # landet statt an dessen Kante
+        if score.any():
+            score = ndimage.uniform_filter1d(
+                score, size=max(3, tab_width_px), mode="wrap"
+            )
+
+        chosen: list[int] = []
+        candidates = list(np.argsort(-score))
+        for r in candidates:
+            if len(chosen) >= n_tabs:
+                break
+            r = int(r)
+            if all(min(abs(r - c), ny - abs(r - c)) >= min_sep for c in chosen):
+                chosen.append(r)
+        # Falls das Muster keine n_tabs ausreichend getrennten Stellen hergibt:
+        # gleichmaessig ueber den Umfang auffuellen.
+        k = 0
+        while len(chosen) < min(n_tabs, ny):
+            r = int(round(k * ny / max(n_tabs, 1))) % ny
+            if r not in chosen:
+                chosen.append(r)
+            k += 1
+            if k > 4 * n_tabs:
+                break
+
+        for center in chosen:
+            for col in run:
+                for d in range(-half, half + 1):
+                    repaired[(center + d) % ny, col] = False
+                # Der Steg muss die Nachbarspalten tatsaechlich erreichen --
+                # bei sehr duennen Materialresten kann das Bild dort selbst
+                # Loch sein; dann waere der Steg wirkungslos. Die allgemeine
+                # Verbindungsstrategie raeumt den Rest auf.
     return repaired
 
 
 # ---------------------------------------------------------------------------
-# 4. Material-Inseln (isolierte Materialfragmente ohne Rand-Verankerung)
+# 4. Allgemeine Verbindungsstrategie: EIN zusammenhaengender Koerper
+# ---------------------------------------------------------------------------
+#
+# Konzept (das eigentliche Kernstueck dieses Moduls)
+# --------------------------------------------------
+# Die Schale ist ein Rohr, dessen Wand genau dort steht, wo die Maske
+# Material sagt. Damit gilt eine einzige, exakte und allgemeine Bedingung
+# fuer die Druckbarkeit:
+#
+#       Die Materialmaske muss GENAU EINE zusammenhaengende Komponente
+#       bilden (Nachbarschaft 8er, theta-Achse periodisch).
+#
+# Jede andere Formulierung ("Insel = beruehrt keinen Bildrand") ist nur ein
+# Spezialfall davon und uebersieht Faelle, die in echten Mustern vorkommen:
+#
+#   * PUZZLE-FALL: ein Segment ist rundum von Schnittlinien eingeschlossen
+#     (Puzzleteil-Inneres, Punkt ueber dem i). Klassische Insel.
+#   * VERSCHACHTELUNG: Insel in einer Insel in einer Insel. Wer jede Insel
+#     einzeln zum naechsten "verankerten" Bereich verbindet, zieht dabei
+#     lange Stege quer durch das ganze Muster.
+#   * GESCHLOSSENE SCHLEIFE UM DEN UMFANG: eine Schnittlinie, die einmal
+#     um den Zylinder herumlaeuft und sich selbst schliesst, ohne dabei
+#     eine einzige volle Bildspalte zu treffen (z.B. eine wellenfoermige
+#     Naht). Sie zerlegt die Schale in zwei Ringe -- beide beruehren den
+#     Bildrand, sind also nach der alten Insel-Definition "verankert" und
+#     wurden damit NICHT erkannt.
+#
+# Die Loesung ist dieselbe fuer alle drei Faelle und braucht keine
+# Fallunterscheidung:
+#
+#   1. Alle Materialfragmente sind Knoten eines Graphen.
+#   2. Zwischen benachbarten Fragmenten gibt es eine Kante, deren Gewicht
+#      die Laenge des KUERZESTEN moeglichen Stegs zwischen ihnen ist.
+#      Diese Kandidaten kommen direkt aus der Feature-Transformation
+#      (Distanztransformation mit Rueckgabe des naechsten Materialpixels):
+#      wo zwei Loch-Pixel nebeneinander liegen, deren jeweils naechstes
+#      Material zu verschiedenen Fragmenten gehoert, verlaeuft die
+#      "Wasserscheide" zwischen genau diesen beiden Fragmenten -- und der
+#      dortige Uebergang ist der kuerzeste Weg zwischen ihnen.
+#   3. Ein MINIMALER SPANNBAUM (Kruskal) ueber diesen Graphen waehlt genau
+#      so viele Stege, wie noetig sind, um alles zu verbinden -- und zwar
+#      die insgesamt kuerzesten. Jeder Steg zerstoert damit ein Minimum an
+#      Schnittmuster, und es entsteht kein einziger ueberfluessiger Steg.
+#
+# Das ist die allgemein verwendbare Strategie: sie kennt weder "Insel" noch
+# "Trennring" als Spezialfall, sondern stellt nur den Zusammenhang her --
+# fuer beliebige Muster, beliebige Verschachtelungstiefe und ueber die
+# theta-Naht hinweg.
+
+
+def find_material_components(hole_mask: np.ndarray):
+    """(labels, num) der Materialfragmente, theta periodisch."""
+    return label_periodic_theta(~hole_mask)
+
+
+def _shortest_bridge_candidates(material: np.ndarray, labels: np.ndarray,
+                                 num: int):
+    """Kuerzeste Verbindungskandidaten zwischen benachbarten Fragmenten.
+
+    Liefert eine Liste von (laenge, label_a, label_b, (r_a, c_a), (r_b, c_b)),
+    je Fragmentpaar nur den kuerzesten Kandidaten.
+
+    Die Analyse laeuft auf einer in theta dreifach gekachelten Kopie, damit
+    Verbindungen ueber die Naht theta=0 <-> theta=ny-1 genauso gefunden
+    werden wie alle anderen.
+    """
+    ny, nx = material.shape
+    if num <= 1:
+        return []
+
+    tiled_material = np.concatenate([material] * 3, axis=0)
+    tiled_labels = np.concatenate([labels] * 3, axis=0)
+    dist, (idx_r, idx_c) = ndimage.distance_transform_edt(
+        ~tiled_material, return_indices=True
+    )
+    owner = tiled_labels[idx_r, idx_c]  # naechstes Fragment je Pixel
+
+    rows = np.arange(ny, 2 * ny)
+    cols = np.arange(nx)
+    rr, cc = np.meshgrid(rows, cols, indexing="ij")
+
+    # Nachbarpaare: in theta (periodisch, deshalb reicht +1 im gekachelten
+    # Raum) und in z (nicht periodisch -> letzte Spalte auslassen)
+    pair_sets = [
+        (rr, cc, rr + 1, cc),
+        (rr[:, :-1], cc[:, :-1], rr[:, :-1], cc[:, :-1] + 1),
+    ]
+
+    w_all, a_all, b_all = [], [], []
+    ra_all, ca_all, rb_all, cb_all = [], [], [], []
+    for r0, c0, r1, c1 in pair_sets:
+        o0 = owner[r0, c0]
+        o1 = owner[r1, c1]
+        sel = o0 != o1
+        if not sel.any():
+            continue
+        r0, c0, r1, c1 = r0[sel], c0[sel], r1[sel], c1[sel]
+        o0, o1 = o0[sel], o1[sel]
+        w = dist[r0, c0] + dist[r1, c1] + 1.0
+        w_all.append(w)
+        a_all.append(np.minimum(o0, o1))
+        b_all.append(np.maximum(o0, o1))
+        # Endpunkte: die jeweils naechsten Materialpixel der beiden Seiten,
+        # passend zur Reihenfolge (a=kleineres Label) sortiert
+        swap = o0 > o1
+        pr0, pc0 = idx_r[r0, c0], idx_c[r0, c0]
+        pr1, pc1 = idx_r[r1, c1], idx_c[r1, c1]
+        ra_all.append(np.where(swap, pr1, pr0))
+        ca_all.append(np.where(swap, pc1, pc0))
+        rb_all.append(np.where(swap, pr0, pr1))
+        cb_all.append(np.where(swap, pc0, pc1))
+
+    if not w_all:
+        return []
+
+    w = np.concatenate(w_all)
+    a = np.concatenate(a_all).astype(np.int64)
+    b = np.concatenate(b_all).astype(np.int64)
+    ra, ca = np.concatenate(ra_all), np.concatenate(ca_all)
+    rb, cb = np.concatenate(rb_all), np.concatenate(cb_all)
+
+    # je Fragmentpaar den kuerzesten Kandidaten behalten
+    key = a * (num + 1) + b
+    order = np.lexsort((w, key))
+    key_sorted = key[order]
+    _, first = np.unique(key_sorted, return_index=True)
+    pick = order[first]
+
+    return [
+        (
+            float(w[i]),
+            int(a[i]),
+            int(b[i]),
+            (int(ra[i]) % ny, int(ca[i])),
+            (int(rb[i]) % ny, int(cb[i])),
+        )
+        for i in pick
+    ]
+
+
+def connect_material_components(hole_mask: np.ndarray,
+                                 bridge_width_px: int = 2,
+                                 max_rounds: int = 3) -> tuple[np.ndarray, dict]:
+    """Verbindet ALLE Materialfragmente zu genau einem Koerper -- ueber einen
+    minimalen Spannbaum der kuerzest moeglichen Stege (siehe Konzept oben).
+
+    Gibt (reparierte Maske, Info-Dict) zurueck.
+    """
+    info = {
+        "components_before": 0,
+        "components_after": 0,
+        "bridges": [],
+        "bridge_pixels_added": 0,
+        "rounds": 0,
+        "connected": False,
+    }
+    repaired = hole_mask.copy()
+    ny, nx = repaired.shape
+
+    labels, num = find_material_components(repaired)
+    info["components_before"] = num
+    if num == 0:
+        # Vollstaendig weggeschnittenes Bild -- hier ist nichts zu verbinden.
+        return repaired, info
+    if num == 1:
+        info["components_after"] = 1
+        info["connected"] = True
+        return repaired, info
+
+    before_material = (~repaired).sum()
+
+    for _ in range(max_rounds):
+        info["rounds"] += 1
+        material = ~repaired
+        candidates = _shortest_bridge_candidates(material, labels, num)
+        if not candidates:
+            break
+
+        # Kruskal: kuerzeste Stege zuerst, nur behalten was wirklich verbindet
+        candidates.sort(key=lambda e: e[0])
+        uf = _UnionFind(num + 1)
+        for length, a, b, pa, pb in candidates:
+            if uf.find(a) == uf.find(b):
+                continue
+            uf.union(a, b)
+            _draw_bridge(repaired, pa[0], pa[1], pb[0], pb[1], ny,
+                         bridge_width_px)
+            info["bridges"].append({
+                "from": a, "to": b, "length_px": length,
+                "at": (pa, pb),
+            })
+
+        labels, num = find_material_components(repaired)
+        if num <= 1:
+            break
+
+    info["components_after"] = num
+    info["connected"] = num == 1
+    info["bridge_pixels_added"] = int((~repaired).sum() - before_material)
+    return repaired, info
+
+
+# ---------------------------------------------------------------------------
+# 4b. Diagnose: klassische "Inseln" (nur noch fuer den Report)
 # ---------------------------------------------------------------------------
 
 def find_material_islands(hole_mask: np.ndarray):
-    """Findet Materialfragmente (== ~hole_mask), die weder den oberen noch
-    den unteren Bildrand (z=0 / z=nx-1) beruehren und daher nach dem
-    Schneiden lose in der Luft haengen wuerden.
+    """Findet Materialfragmente, die weder den oberen noch den unteren
+    Bildrand (z=0 / z=nx-1) beruehren.
 
-    Randberuehrende Fragmente sind sicher (ueber die Stirnkappe verankert)
-    und werden NICHT als Insel gezaehlt -- das deckt genau den Fall
-    "Linie laeuft nach unten bis zum Rand" ab.
+    HINWEIS: das ist nur noch eine DIAGNOSE fuer den Report. Die tatsaechliche
+    Reparatur richtet sich nach der schaerferen und allgemeineren Bedingung
+    aus Abschnitt 4 (genau eine Komponente) -- ein randberuehrendes Fragment
+    kann sehr wohl ein loses Einzelteil sein, wenn die Schnittlinie als
+    geschlossene Schleife um den Umfang laeuft.
     """
     material = ~hole_mask
     labels, num = label_periodic_theta(material)
@@ -207,68 +508,26 @@ def find_material_islands(hole_mask: np.ndarray):
                set(labels[:, nx - 1][material[:, nx - 1]].tolist())
     anchored.discard(0)
 
+    sizes = np.bincount(labels.ravel(), minlength=num + 1)
+    objects = ndimage.find_objects(labels)
+
     islands = {}
     for lbl in range(1, num + 1):
-        if lbl in anchored:
+        if lbl in anchored or sizes[lbl] == 0:
             continue
-        ys, xs = np.where(labels == lbl)
-        if len(ys) == 0:
+        sl = objects[lbl - 1]
+        if sl is None:
             continue
+        sub = labels[sl] == lbl
+        ys, xs = np.where(sub)
+        ys = ys + sl[0].start
+        xs = xs + sl[1].start
         islands[lbl] = {
-            "size": len(ys),
+            "size": int(sizes[lbl]),
             "pixels": (ys, xs),
             "centroid": (float(ys.mean()), float(xs.mean())),
         }
     return islands, labels
-
-
-def bridge_islands(hole_mask: np.ndarray, islands: dict, labels: np.ndarray,
-                    bridge_width_px: int = 2) -> np.ndarray:
-    """Verbindet jede Insel ueber den kuerzesten Weg mit dem naechsten
-    verankerten Materialbereich (periodisch in theta gedacht) durch einen
-    duennen Materialsteg."""
-    if not islands:
-        return hole_mask.copy()
-
-    repaired = hole_mask.copy()
-    material = ~hole_mask
-    ny, nx = hole_mask.shape
-
-    # "Ziel"-Maske: verankertes Material (alles Material, das NICHT selbst
-    # zu einer der gefundenen Inseln gehoert)
-    island_label_set = set(islands.keys())
-    is_island_pixel = np.isin(labels, list(island_label_set))
-    anchored_material = material & ~is_island_pixel
-
-    if not anchored_material.any():
-        # Kein sicherer Zielbereich vorhanden -- degenerate Eingabe, nichts
-        # Sinnvolles zu tun.
-        return repaired
-
-    # Fuer den periodischen Umlauf: Ziel-Maske dreifach uebereinander stapeln,
-    # damit der Distanztransform auch "ueber die Naht" die kuerzeste
-    # Verbindung findet.
-    tiled_target = np.concatenate(
-        [anchored_material, anchored_material, anchored_material], axis=0
-    )
-    dist, (idx_r, idx_c) = ndimage.distance_transform_edt(
-        ~tiled_target, return_indices=True
-    )
-
-    for lbl, info in islands.items():
-        ys, xs = info["pixels"]
-        # In den gekachelten Raum verschieben (mittlere Kachel = Original)
-        tys = ys + ny
-        d_here = dist[tys, xs]
-        best = np.argmin(d_here)
-        src_r, src_c = int(ys[best]), int(xs[best])
-        tgt_r_tiled = int(idx_r[tys[best], xs[best]])
-        tgt_c = int(idx_c[tys[best], xs[best]])
-        tgt_r = tgt_r_tiled % ny
-
-        _draw_bridge(repaired, src_r, src_c, tgt_r, tgt_c, ny, bridge_width_px)
-
-    return repaired
 
 
 def _draw_bridge(mask: np.ndarray, r0: int, c0: int, r1: int, c1: int,
@@ -284,9 +543,9 @@ def _draw_bridge(mask: np.ndarray, r0: int, c0: int, r1: int, c1: int,
         else:
             r1 += ny
 
+    half = max(width_px, 1) // 2
     for r, c in _bresenham(r0, c0, r1, c1):
         rr = r % ny
-        half = width_px // 2
         for d in range(-half, half + 1):
             mask[(rr + d) % ny, c] = False
 
@@ -319,14 +578,22 @@ def _bresenham(r0, c0, r1, c1):
 def repair_cut_mask(hole_mask: np.ndarray, bridge_width_px: int = 2,
                      severing_tab_width_px: int = 3,
                      severing_n_tabs: int = 2) -> tuple[np.ndarray, dict]:
-    """Repariert Trenn-Ringe und Material-Inseln. Gibt (reparierte Maske,
-    Report) zurueck."""
+    """Macht aus einer beliebigen Lochmaske eine druckbare Lochmaske.
+
+    Reihenfolge:
+      1. Trenn-Ringe (volle Umlauf-Schnitte) mit mehreren Stegen verstaerken
+         -- rein strukturell, damit ein durchtrennter Zylinder nicht nur an
+         einem einzigen duennen Steg haengt.
+      2. Allgemeine Verbindungsstrategie: minimaler Spannbaum ueber alle
+         Materialfragmente -> genau ein zusammenhaengender Koerper.
+
+    Gibt (reparierte Maske, Report) zurueck.
+    """
     report = {
         "severing_rings_found": [],
         "severing_rings_fixed": False,
         "islands_found": 0,
         "island_details": [],
-        "islands_bridged": 0,
     }
 
     working = hole_mask.copy()
@@ -339,17 +606,22 @@ def repair_cut_mask(hole_mask: np.ndarray, bridge_width_px: int = 2,
         )
         report["severing_rings_fixed"] = True
 
-    islands, labels = find_material_islands(working)
+    islands, _ = find_material_islands(working)
     report["islands_found"] = len(islands)
     report["island_details"] = [
         {"size": v["size"], "centroid": v["centroid"]} for v in islands.values()
     ]
-    if islands:
-        working = bridge_islands(working, islands, labels, bridge_width_px)
-        report["islands_bridged"] = len(islands)
 
-    # Sicherheits-Check: nach der Reparatur duerfen keine Inseln/Trennringe
-    # mehr uebrig sein.
+    working, connect_info = connect_material_components(
+        working, bridge_width_px=bridge_width_px
+    )
+    report["components_found"] = connect_info["components_before"]
+    report["bridges_added"] = len(connect_info["bridges"])
+    report["bridge_pixels_added"] = connect_info["bridge_pixels_added"]
+    report["single_body"] = connect_info["connected"]
+    report["components_remaining"] = connect_info["components_after"]
+
+    # Sicherheits-Check: nach der Reparatur darf nichts mehr uebrig sein.
     remaining_islands, _ = find_material_islands(working)
     remaining_severing = find_severing_rings(working)
     report["remaining_islands"] = len(remaining_islands)
@@ -361,26 +633,42 @@ def repair_cut_mask(hole_mask: np.ndarray, bridge_width_px: int = 2,
 # ---------------------------------------------------------------------------
 # 6. Geometrieerzeugung (Konzept D: reine Rotation, keine Radial-Finger)
 # ---------------------------------------------------------------------------
+#
+# Radiale Zonierung (von aussen nach innen), analytisch garantiert:
+#
+#   R_out   = radius_mm                              Aussenflaeche der Schale
+#   R_in    = R_out - wall_thickness_mm              Innenflaeche der Schale
+#   R_core  = R_in  - radial_clearance_mm            Mantelflaeche des Kerns
+#   R_plug  = R_out - flush_offset_mm                Oberkante der Stopfen
+#
+# Die Schale ist ein Rohr konstanter Wandstaerke mit durchgehenden Loechern.
+# Der Kern ist ein VOLLZYLINDER (nur die Achsbohrung ist hohl) mit erhabenen
+# Stopfen, die in die Loecher der Schale ragen. Weil die Stopfen seitlich um
+# das Bewegungsspiel kleiner sind als die Loecher, koennen sich Schale und
+# Kern niemals durchdringen -- das ist hier nicht mehr per Boolean-Carve
+# erzwungen, sondern folgt direkt aus der Radienstaffelung.
 
-def _radial_erode_for_clearance(hole_mask: np.ndarray, clearance_mm: float,
-                                 pixel_pitch_theta_mm: float,
-                                 pixel_pitch_z_mm: float) -> np.ndarray:
-    """Erodiert den Materialbereich (~hole_mask) leicht, damit der Kern-Stopfen
-    kleiner als das Loch ist und sich reibungsfrei darin verdrehen laesst."""
+
+def _plug_mask_for_clearance(hole_mask: np.ndarray, clearance_mm: float,
+                              pixel_pitch_theta_mm: float,
+                              pixel_pitch_z_mm: float) -> np.ndarray:
+    """Die Stopfen des Kerns sitzen IN den Loechern der Schale (nicht unter
+    deren Wand!) und sind ringsum um das Bewegungsspiel kleiner als das Loch.
+    Deshalb wird die LOCH-Maske erodiert."""
     if clearance_mm <= 0:
-        return ~hole_mask
+        return hole_mask.copy()
     er_theta = max(1, int(round(clearance_mm / max(pixel_pitch_theta_mm, 1e-6))))
     er_z = max(1, int(round(clearance_mm / max(pixel_pitch_z_mm, 1e-6))))
     struct = np.ones((2 * er_theta + 1, 2 * er_z + 1), dtype=bool)
-    return ndimage.binary_erosion(~hole_mask, structure=struct, border_value=0)
-
-
-def _build_radius_field(hole_mask_shape_ny_nx, hole_or_plug_mask: np.ndarray,
-                         base_r: float, raised_r: float, recessed_r: float
-                         ) -> np.ndarray:
-    """raised_r wo hole_or_plug_mask True ist, sonst recessed_r/base_r."""
-    field = np.where(hole_or_plug_mask, raised_r, base_r)
-    return field
+    # Die theta-Achse ist PERIODISCH: ohne umlaufendes Padding wuerde an der
+    # Naht theta=0/theta=ny-1 ein Stopfen direkt neben der Schalenwand stehen
+    # bleiben (er "sieht" die Wand auf der anderen Seite der Naht nicht) --
+    # genau dort haben sich Schale und Kern dann durchdrungen.
+    padded = np.pad(hole_mask, ((er_theta, er_theta), (0, 0)), mode="wrap")
+    # border_value=1 wirkt danach nur noch auf den z-Rand (Stirnflaechen):
+    # dort grenzt kein Schalenmaterial an, der Stopfen darf stehen bleiben.
+    eroded = ndimage.binary_erosion(padded, structure=struct, border_value=1)
+    return eroded[er_theta:er_theta + hole_mask.shape[0], :]
 
 
 def _vertices_from_radius_field(radius_field: np.ndarray, radius_mm: float,
@@ -495,6 +783,32 @@ def _axis_cylinder(mesh: trimesh.Trimesh, axis_diameter_mm: float,
     return cyl
 
 
+def _bore_cylinder(radius: float, height_mm: float, sections: int = 96
+                    ) -> trimesh.primitives.Cylinder:
+    """Zylinder von z=-margin bis z=height+margin -- zum Aushoehlen der
+    Schale (Innenflaeche) bzw. fuer die Achsbohrung."""
+    margin = max(1.0, 0.05 * height_mm)
+    cyl = trimesh.primitives.Cylinder(
+        radius=radius, height=height_mm + 2 * margin, sections=sections
+    )
+    cyl.apply_translation([0, 0, height_mm / 2])
+    return cyl
+
+
+def count_bodies(mesh: trimesh.Trimesh) -> int:
+    """Anzahl zusammenhaengender Teilkoerper eines Meshes -- der finale
+    Beweis, dass keine losen Fragmente ("Inseln") im Export stecken."""
+    if mesh.is_empty or len(mesh.faces) == 0:
+        return 0
+    try:
+        components = trimesh.graph.connected_components(
+            mesh.face_adjacency, nodes=np.arange(len(mesh.faces))
+        )
+        return len(components)
+    except Exception:  # pragma: no cover - defensive
+        return len(mesh.split(only_watertight=False))
+
+
 def check_no_overlap(mesh_a: trimesh.Trimesh, mesh_b: trimesh.Trimesh,
                       volume_tolerance: float = 1e-6) -> tuple[bool, float]:
     """Rechnet die tatsaechliche Boolean-Schnittmenge zweier Meshes aus und
@@ -507,7 +821,7 @@ def check_no_overlap(mesh_a: trimesh.Trimesh, mesh_b: trimesh.Trimesh,
     """
     try:
         overlap = mesh_a.intersection(mesh_b, engine="manifold")
-    except Exception as exc:  # pragma: no cover - defensive
+    except Exception:  # pragma: no cover - defensive
         return False, float("nan")
     if overlap.is_empty:
         return True, 0.0
@@ -526,91 +840,137 @@ def build_dual_cylinder(
     bridge_width_px: int = 2,
     cut_through: bool = True,
     verify_no_overlap: bool = True,
+    min_core_wall_mm: float = 2.0,
 ) -> tuple[trimesh.Trimesh, trimesh.Trimesh, dict]:
-    """Erzeugt Schale (mit Loechern) und Kern (mit passenden Stopfen) fuer
-    das Rotations-Auswerfer-Konzept.
+    """Erzeugt Schale (Rohr mit Loechern) und Kern (Vollzylinder mit
+    Stopfen) fuer das Rotations-Auswerfer-Konzept.
 
     cut_mask.shape == (ny, nx), True == hier wird geschnitten (Loch).
     axis 0 (ny) = Umfang/theta (periodisch), axis 1 (nx) = Achse/z (offen).
 
-    Wichtig zur Kollisionsfreiheit: beide Teile werden zunaechst als volle
-    Rotationskoerper von der Mittelachse aus aufgebaut (wie das bestehende
-    Lithophane-Verfahren). Das allein GARANTIERT noch keinen Bauraum fuer
-    den jeweils anderen Teil -- Kern und Schale wuerden sich sonst im
-    gesamten Bereich von der Achse bis zu ihrem jeweiligen Musterradius
-    ueberlappen. Deshalb wird aus der Schale explizit ein "Freiraum-Koerper"
-    (Kern-Kontur + radial_clearance_mm) per Boolean-Differenz herausgeschnitten
-    -- das erzwingt die radiale Zonierung geometrisch statt sie nur uebers
-    Zahlenwerk zu unterstellen.
+    HALTBARKEIT (das war der zweite gemeldete Fehler)
+    --------------------------------------------------
+    Die Vorgaengerversion hat die Schale mit einem MUSTERFOERMIGEN
+    Freiraum-Koerper ausgeschnitten und dabei auch unter der Schneidenwand
+    Material weggenommen -- uebrig blieb eine papierduenne Haut statt einer
+    Wand. Zusaetzlich sassen die Kern-Stopfen wegen einer vertauschten
+    Maske UNTER der Wand statt in den Loechern, wodurch der Kern die Schale
+    von innen ausgehoehlt hat. Ergebnis: zwei duennwandige, kaum belastbare
+    Teile.
+
+    Jetzt gilt die feste Radienstaffelung aus dem Kommentar oben:
+    die Schale ist ein Rohr mit ueberall voller Wandstaerke (nur die Loecher
+    gehen durch), der Kern ist massiv (nur die Achsbohrung ist hohl). Die
+    Kollisionsfreiheit folgt aus den Radien und der seitlichen Erosion der
+    Stopfen -- sie wird zusaetzlich per Boolean nachgerechnet.
     """
     ny, nx = cut_mask.shape
     repaired_mask, report = repair_cut_mask(cut_mask, bridge_width_px=bridge_width_px)
 
-    circumference_mm = 2 * np.pi * radius_mm
+    r_out = float(radius_mm)
+    r_in = r_out - float(wall_thickness_mm)
+    r_core = r_in - float(radial_clearance_mm)
+    r_plug = r_out - float(flush_offset_mm)
+
+    axis_r = (float(axis_diameter_mm) / 2.0) if (axis_diameter_mm and cut_through) else 0.0
+    if r_in <= 0 or r_core <= 0:
+        raise ValueError(
+            f"Wandstaerke ({wall_thickness_mm} mm) + Spiel ({radial_clearance_mm} mm) "
+            f"passen nicht in den Radius ({radius_mm} mm)."
+        )
+
+    warnings: list[str] = []
+    core_wall = r_core - axis_r
+    if axis_r > 0 and core_wall < min_core_wall_mm:
+        warnings.append(
+            f"Kernwand zwischen Achsbohrung und Mantel ist nur {core_wall:.2f} mm "
+            f"(empfohlen >= {min_core_wall_mm:.1f} mm) -- Achse duenner waehlen "
+            f"oder Radius vergroessern."
+        )
+    if wall_thickness_mm < 1.0:
+        warnings.append(
+            f"Schalenwand {wall_thickness_mm:.2f} mm ist sehr duenn "
+            f"(< 1 mm ~ 2 Perimeter) -- geringe Haltbarkeit."
+        )
+
+    circumference_mm = 2 * np.pi * r_out
     pixel_pitch_theta_mm = circumference_mm / ny
     pixel_pitch_z_mm = height_mm / max(nx - 1, 1)
 
-    # --- Kern: Stopfen an derselben Position wie die Loecher (Ruhelage,
-    # KEINE Phasenverschiebung -- siehe Modul-Docstring), leicht erodiert
-    # fuer Drehspiel ---
-    plug_mask = _radial_erode_for_clearance(
+    # --- Kern: massiver Zylinder mit Stopfen IN den Loechern der Schale ---
+    plug_mask = _plug_mask_for_clearance(
         repaired_mask, radial_clearance_mm, pixel_pitch_theta_mm, pixel_pitch_z_mm
     )
-    core_field = np.where(
-        plug_mask,
-        radius_mm - flush_offset_mm,               # Stopfen: fast buendig mit Schale
-        radius_mm - wall_thickness_mm - radial_clearance_mm,  # Rest: zurueckgesetzt, Luft zur Schale
-    )
-    core_vertices = _vertices_from_radius_field(core_field, radius_mm, height_mm)
+    core_field = np.where(plug_mask, r_plug, r_core)
+    core_vertices = _vertices_from_radius_field(core_field, r_out, height_mm)
     core_mesh = _finish_mesh(core_vertices, ny, nx)
 
-    # --- Freiraum-Koerper: Kern-Kontur + Sicherheitsabstand, dient NUR dazu,
-    # die Schale radial auszusparen -- wird selbst nicht exportiert. ---
-    clearance_field = core_field + radial_clearance_mm
-    clearance_vertices = _vertices_from_radius_field(clearance_field, radius_mm, height_mm)
-    clearance_mesh = _finish_mesh(clearance_vertices, ny, nx)
-
-    # --- Schale: volle Musterkontur, danach um den Freiraum-Koerper
-    # ausgespart -- das erzeugt die duenne Ring-Wand UND die Loch-Bereiche
-    # (dort ist shell_field ohnehin sehr tief, siehe unten) in einem Schritt. ---
-    shell_field = np.where(
-        repaired_mask,
-        radius_mm - wall_thickness_mm * 2.0,   # tief -> wird Loch
-        radius_mm + wall_thickness_mm,          # normale Schneidenwand
-    )
-    shell_vertices = _vertices_from_radius_field(shell_field, radius_mm, height_mm)
+    # --- Schale: volle Wand ueberall, Loecher gehen durch ---
+    # Ausserhalb der Loecher steht die Wand von r_in bis r_out; in den
+    # Loechern wird das Radiusfeld unter r_in gelegt, sodass beim Aushoehlen
+    # mit dem Innenzylinder dort nichts uebrig bleibt -> durchgehendes Loch.
+    shell_field = np.where(repaired_mask, r_core, r_out)
+    shell_vertices = _vertices_from_radius_field(shell_field, r_out, height_mm)
     shell_mesh = _finish_mesh(shell_vertices, ny, nx)
 
+    bore = _bore_cylinder(r_in, height_mm)
     try:
-        carved = shell_mesh.difference(clearance_mesh, engine="manifold")
-        if not carved.is_empty:
-            shell_mesh = carved
-            report["clearance_carved"] = True
+        hollowed = shell_mesh.difference(bore, engine="manifold")
+        if not hollowed.is_empty:
+            shell_mesh = hollowed
+            report["shell_hollowed"] = True
         else:
-            report["clearance_carved"] = False
+            report["shell_hollowed"] = False
+            warnings.append("Aushoehlen der Schale lieferte ein leeres Mesh.")
     except Exception as exc:  # pragma: no cover - defensive
-        report["clearance_carved"] = False
-        report["clearance_carve_error"] = str(exc)
+        report["shell_hollowed"] = False
+        report["shell_hollow_error"] = str(exc)
+        warnings.append(f"Aushoehlen der Schale fehlgeschlagen: {exc}")
 
-    # --- Achsbohrung fuer die Handkurbel/Achse durch BEIDE Teile ---
+    # --- Achsbohrung: NUR durch den Kern. Die Schale ist bereits ein Rohr
+    # mit deutlich groesserem Innendurchmesser -- eine zusaetzliche Bohrung
+    # wuerde dort nichts entfernen (und die Achse laeuft im Kern). ---
     if axis_diameter_mm and cut_through:
-        for name, mesh in (("shell", shell_mesh), ("core", core_mesh)):
-            try:
-                axis_cyl = _axis_cylinder(mesh, axis_diameter_mm)
-                cut_result = mesh.difference(axis_cyl, engine="manifold")
-                if not cut_result.is_empty:
-                    if name == "shell":
-                        shell_mesh = cut_result
-                    else:
-                        core_mesh = cut_result
-                    report[f"axis_hole_cut_{name}"] = True
-                else:
-                    report[f"axis_hole_cut_{name}"] = False
-            except Exception as exc:  # pragma: no cover - defensive
-                report[f"axis_hole_cut_{name}"] = False
-                report[f"axis_hole_error_{name}"] = str(exc)
+        try:
+            axis_cyl = _axis_cylinder(core_mesh, axis_diameter_mm)
+            cut_result = core_mesh.difference(axis_cyl, engine="manifold")
+            if not cut_result.is_empty:
+                core_mesh = cut_result
+                report["axis_hole_cut_core"] = True
+            else:
+                report["axis_hole_cut_core"] = False
+        except Exception as exc:  # pragma: no cover - defensive
+            report["axis_hole_cut_core"] = False
+            report["axis_hole_error_core"] = str(exc)
+        # Die Schale bekommt keine eigene Bohrung mehr; fuer Aufrufer, die
+        # den alten Report-Schluessel lesen, bleibt er aussagekraeftig.
+        report["axis_hole_cut_shell"] = False
 
     report["plug_pixels"] = int(plug_mask.sum())
+    report["radii_mm"] = {
+        "shell_outer": r_out,
+        "shell_inner": r_in,
+        "core_outer": r_core,
+        "plug_top": r_plug,
+        "axis": axis_r,
+    }
+    report["shell_wall_thickness_mm"] = r_out - r_in
+    report["core_wall_thickness_mm"] = core_wall if axis_r > 0 else r_core
+    report["shell_volume_mm3"] = float(shell_mesh.volume) if shell_mesh.is_volume else float("nan")
+    report["core_volume_mm3"] = float(core_mesh.volume) if core_mesh.is_volume else float("nan")
+    # Massivitaet des Kerns: 1.0 == Vollzylinder (abzueglich Achsbohrung)
+    nominal_core = float(np.pi * (r_core ** 2 - axis_r ** 2) * height_mm)
+    if nominal_core > 0 and np.isfinite(report["core_volume_mm3"]):
+        report["core_fill_ratio"] = report["core_volume_mm3"] / nominal_core
+    report["shell_bodies"] = count_bodies(shell_mesh)
+    report["core_bodies"] = count_bodies(core_mesh)
+    if report["shell_bodies"] > 1:
+        warnings.append(
+            f"Schale besteht aus {report['shell_bodies']} losen Teilen -- "
+            f"die Verbindungsstrategie konnte das Muster nicht vollstaendig "
+            f"zusammenfuehren."
+        )
+    report["warnings"] = warnings
 
     if verify_no_overlap:
         ok, vol = check_no_overlap(shell_mesh, core_mesh)
@@ -649,9 +1009,104 @@ def _test_island_is_detected_and_fixed():
     assert len(islands) == 1, f"Erwartete 1 Insel, gefunden: {len(islands)}"
 
     repaired, report = repair_cut_mask(hole)
-    assert report["islands_found"] == 1
+    assert report["single_body"], "Maske ist nach der Reparatur nicht zusammenhaengend"
     assert report["remaining_islands"] == 0, "Insel nach Reparatur nicht mehr vorhanden sein"
     print("PASS: Insel wird erkannt und automatisch angebunden")
+
+
+def _test_enclosed_puzzle_segments_are_all_connected():
+    """Der gemeldete Grenzfall: ein Puzzle-artiges Muster, bei dem die
+    Schnittlinien geschlossene Zellen bilden und JEDES Segment vollstaendig
+    eingeschlossen ist -- inklusive Verschachtelung (Zelle in Zelle).
+    Danach muss die Maske GENAU EINE Komponente sein, und der Spannbaum darf
+    dafuer nur die minimal noetige Zahl an Stegen setzen (Komponenten - 1)."""
+    ny, nx = 90, 70
+    hole = np.zeros((ny, nx), dtype=bool)
+    # Gitter aus geschlossenen Zellen (Puzzle-Raster), umlaufend in theta
+    for r in range(0, ny, 30):
+        hole[r:r + 2, 6:64] = True
+    for c in range(6, 65, 16):
+        hole[:, c:c + 2] = True
+    # verschachtelte Zelle: eine Zelle bekommt noch einen inneren Ring
+    hole[10:24, 40:56] = True
+    hole[13:21, 43:53] = False
+    hole[16:18, 46:50] = True
+
+    _, num_before = find_material_components(hole)
+    assert num_before > 5, f"Testmuster liefert nur {num_before} Fragmente"
+
+    repaired, report = repair_cut_mask(hole)
+    _, num_after = find_material_components(repaired)
+    assert num_after == 1, (
+        f"Nach der Reparatur sind noch {num_after} lose Fragmente uebrig"
+    )
+    assert report["single_body"]
+    # Der Spannbaum setzt nie mehr Stege als noetig.
+    assert report["bridges_added"] <= report["components_found"] - 1, (
+        f"{report['bridges_added']} Stege fuer {report['components_found']} "
+        f"Fragmente -- der Spannbaum haette hoechstens "
+        f"{report['components_found'] - 1} setzen duerfen"
+    )
+    print(
+        f"PASS: {num_before} eingeschlossene Puzzle-Segmente mit "
+        f"{report['bridges_added']} minimalen Stegen zu einem Koerper verbunden"
+    )
+
+
+def _test_closed_loop_around_circumference_is_reconnected():
+    """Eine wellenfoermige Schnittlinie, die sich einmal um den Umfang
+    schliesst, trennt die Schale in zwei Ringe -- OHNE dass eine einzige
+    Bildspalte komplett Loch waere und ohne dass eines der beiden Teile den
+    Bildrand verfehlt. Die alte 'Insel = beruehrt keinen Rand'-Regel hat
+    genau hier nichts gefunden und eine in zwei Teile zerfallende Schale
+    ausgeliefert."""
+    ny, nx = 80, 60
+    hole = np.zeros((ny, nx), dtype=bool)
+    for r in range(ny):
+        c = int(30 + 8 * np.sin(2 * np.pi * r / ny))
+        hole[r, c:c + 3] = True
+
+    assert find_severing_rings(hole) == [], "Testfall soll KEINEN Trennring haben"
+    islands, _ = find_material_islands(hole)
+    assert len(islands) == 0, "Testfall soll nach alter Definition 'sauber' aussehen"
+    _, num_before = find_material_components(hole)
+    assert num_before == 2, f"Erwartet 2 getrennte Ringe, gefunden {num_before}"
+
+    repaired, report = repair_cut_mask(hole)
+    _, num_after = find_material_components(repaired)
+    assert num_after == 1, "Geschlossene Umfangsschleife wurde nicht ueberbrueckt"
+    assert report["bridges_added"] >= 1
+    print("PASS: Geschlossene Schnittschleife um den Umfang wird erkannt und ueberbrueckt")
+
+
+def _test_bridge_is_taken_to_the_nearest_neighbour_not_across_the_pattern():
+    """Kern der Strategie: verschachtelte Fragmente werden an ihren
+    NACHBARN angebunden (Spannbaum), nicht einzeln quer durch das ganze
+    Muster zu einem 'verankerten' Bereich gezogen. Messbar am insgesamt
+    zugefuegten Material."""
+    ny, nx = 80, 60
+    hole = np.zeros((ny, nx), dtype=bool)
+    hole[10:70, 10:50] = True
+    hole[14:66, 14:46] = False
+    hole[18:62, 18:42] = True
+    hole[22:58, 22:38] = False
+    hole[26:54, 26:34] = True
+    hole[30:50, 28:32] = False
+
+    repaired, report = repair_cut_mask(hole)
+    _, num_after = find_material_components(repaired)
+    assert num_after == 1
+    # Drei Ringe a 4 px Wandstaerke: die Summe der kuerzesten Stege liegt bei
+    # rund 3 * 4 px * Stegbreite. Alles deutlich darueber bedeutet, dass ein
+    # Steg quer durch mehrere Ringe gezogen wurde.
+    assert report["bridge_pixels_added"] <= 45, (
+        f"{report['bridge_pixels_added']} Steg-Pixel -- die Stege laufen quer "
+        f"durch das Muster statt zum jeweils naechsten Nachbarn"
+    )
+    print(
+        f"PASS: Verschachtelte Fragmente werden nachbarschaftlich verbunden "
+        f"({report['bridge_pixels_added']} Steg-Pixel)"
+    )
 
 
 def _test_boundary_touching_line_is_not_an_island():
@@ -844,9 +1299,177 @@ def _test_seamless_tile_pattern_produces_watertight_overlap_free_result():
     )
 
 
+def _test_shell_wall_is_full_thickness_and_core_is_solid():
+    """Der zweite gemeldete Fehler: 'beide Zylinder hohl -> geringe
+    Haltbarkeit'. Nachgerechnet am echten Volumen:
+
+      * Die Schale muss ein Rohr mit VOLLER Wandstaerke sein -- ihr Volumen
+        entspricht dem Kreisring (r_in..r_out) mal Hoehe, abzueglich der
+        Loecher. Die alte Version hat unter der Wand zusaetzlich Material
+        weggeschnitten und kam auf einen Bruchteil davon.
+      * Der Kern muss MASSIV sein (nur die Achsbohrung ist hohl)."""
+    ny, nx = 90, 60
+    hole = np.zeros((ny, nx), dtype=bool)
+    hole[20:40, 15:45] = True          # ein grosses Lochfeld
+    hole[60:70, 10:30] = True
+
+    radius, height, wall, clearance = 25.0, 40.0, 2.0, 0.4
+    axis_d = 6.0
+    shell, core, report = build_dual_cylinder(
+        hole, radius_mm=radius, height_mm=height, wall_thickness_mm=wall,
+        radial_clearance_mm=clearance, axis_diameter_mm=axis_d, cut_through=True,
+    )
+
+    r_out, r_in = radius, radius - wall
+    hole_fraction = float(hole.mean())
+    nominal_ring = np.pi * (r_out ** 2 - r_in ** 2) * height
+    expected_shell = nominal_ring * (1.0 - hole_fraction)
+    assert shell.volume > 0.75 * expected_shell, (
+        f"Schalenvolumen {shell.volume:.0f} mm3 statt ~{expected_shell:.0f} mm3 -- "
+        f"die Wand ist duenner als die geforderten {wall} mm"
+    )
+    assert report["shell_wall_thickness_mm"] == wall
+
+    r_core = r_in - clearance
+    nominal_core = np.pi * (r_core ** 2 - (axis_d / 2) ** 2) * height
+    assert core.volume > 0.95 * nominal_core, (
+        f"Kernvolumen {core.volume:.0f} mm3 statt ~{nominal_core:.0f} mm3 -- "
+        f"der Kern ist hohl statt massiv"
+    )
+    assert report["core_fill_ratio"] > 0.95
+    assert report["overlap_free"], report["overlap_volume_mm3"]
+    print(
+        f"PASS: Schale ist ein Rohr voller Wandstaerke "
+        f"({shell.volume:.0f}/{expected_shell:.0f} mm3), Kern ist massiv "
+        f"(Fuellgrad {report['core_fill_ratio']:.2f})"
+    )
+
+
+def _test_plugs_sit_in_the_holes_not_under_the_wall():
+    """Die Stopfen des Kerns muessen IN den Loechern der Schale stehen (dort
+    schieben sie beim Verdrehen den Teig heraus) -- nicht unter der Wand.
+    Genau das war vertauscht: die Stopfen sassen auf der MATERIAL-Maske und
+    haben damit die Schalenwand von innen aufgefressen.
+
+    Geprueft am Radiusprofil der Kern-Vertices an einer Loch- und einer
+    Materialposition."""
+    ny, nx = 60, 48
+    hole = np.zeros((ny, nx), dtype=bool)
+    hole[20:40, 16:32] = True
+
+    radius, height, wall, clearance, flush = 25.0, 40.0, 2.0, 0.4, 0.2
+    _, core, report = build_dual_cylinder(
+        hole, radius_mm=radius, height_mm=height, wall_thickness_mm=wall,
+        radial_clearance_mm=clearance, flush_offset_mm=flush,
+        axis_diameter_mm=None, cut_through=False,
+    )
+    r_core = radius - wall - clearance
+    r_plug = radius - flush
+
+    verts = core.vertices
+    vert_r = np.linalg.norm(verts[:, :2], axis=1)
+    vert_theta = np.mod(np.arctan2(verts[:, 1], verts[:, 0]), 2 * np.pi)
+    vert_z = verts[:, 2]
+
+    def band(theta_lo, theta_hi, z_lo, z_hi):
+        sel = (
+            (vert_theta >= 2 * np.pi * theta_lo / ny)
+            & (vert_theta <= 2 * np.pi * theta_hi / ny)
+            & (vert_z >= height * z_lo / (nx - 1))
+            & (vert_z <= height * z_hi / (nx - 1))
+        )
+        return vert_r[sel]
+
+    r_in_hole = band(24, 36, 20, 28).max()      # mitten im Lochfeld
+    r_under_wall = band(2, 14, 20, 28).max()    # gleiche z-Hoehe, aber Material
+
+    assert abs(r_in_hole - r_plug) < 1e-6, (
+        f"Kern reicht am LOCH nur bis r={r_in_hole:.2f} mm, erwartet "
+        f"{r_plug:.2f} mm -- der Stopfen fehlt dort"
+    )
+    assert r_under_wall <= radius - wall - clearance + 1e-6, (
+        f"Kern reicht unter der SCHALENWAND bis r={r_under_wall:.2f} mm "
+        f"(Wandinnenseite {radius - wall:.2f} mm) -- die Stopfen sitzen auf "
+        f"der falschen Maske und hoehlen die Schale aus"
+    )
+    assert abs(r_under_wall - r_core) < 1e-6
+    assert report["plug_pixels"] > 0
+    print(
+        f"PASS: Stopfen stehen im Loch (r={r_in_hole:.2f} mm) und nicht unter "
+        f"der Wand (r={r_under_wall:.2f} mm)"
+    )
+
+
+def _test_plug_clearance_respects_the_theta_seam():
+    """Regressionstest: die Erosion, die den Stopfen kleiner als das Loch
+    macht, muss die UMLAUFENDE theta-Achse beruecksichtigen. Ohne
+    periodisches Padding blieb an der Naht theta=0/theta=ny-1 ein Stopfen
+    direkt neben der Schalenwand stehen -- Schale und Kern haben sich dort
+    durchdrungen (im UI-Testlauf mit ~4 mm3)."""
+    ny, nx = 64, 40
+    hole = np.zeros((ny, nx), dtype=bool)
+    # Lochfeld, das ueber die Naht laeuft und auf der anderen Seite direkt
+    # an Material grenzt
+    hole[0:12, 8:32] = True
+    hole[ny - 12:ny, 8:32] = True
+
+    radius, height, wall, clearance = 25.0, 40.0, 2.0, 0.4
+    plug = _plug_mask_for_clearance(
+        hole, clearance, 2 * np.pi * radius / ny, height / (nx - 1)
+    )
+    # Kein Stopfenpixel darf (periodisch in theta) an Material grenzen.
+    material = ~hole
+    dilated_material = ndimage.binary_dilation(
+        np.pad(material, ((1, 1), (0, 0)), mode="wrap"),
+        structure=np.ones((3, 3), dtype=bool),
+    )[1:-1, :]
+    assert not (plug & dilated_material).any(), (
+        "Stopfen steht direkt neben der Schalenwand -- die Erosion hat die "
+        "theta-Naht nicht beruecksichtigt"
+    )
+
+    shell, core, report = build_dual_cylinder(
+        hole, radius_mm=radius, height_mm=height, wall_thickness_mm=wall,
+        radial_clearance_mm=clearance, axis_diameter_mm=6.0, cut_through=True,
+    )
+    assert report["overlap_free"], (
+        f"Schale und Kern ueberlappen an der theta-Naht: "
+        f"{report['overlap_volume_mm3']} mm3"
+    )
+    print("PASS: Stopfen-Spiel gilt auch ueber die theta-Naht hinweg")
+
+
+def _test_result_is_a_single_body_per_part():
+    """Endgueltiger Beweis, dass keine losen Teile exportiert werden: Schale
+    und Kern muessen aus je genau EINEM zusammenhaengenden Koerper bestehen --
+    auch bei einem Muster mit eingeschlossenen Segmenten."""
+    ny, nx = 72, 48
+    hole = np.zeros((ny, nx), dtype=bool)
+    for r in range(0, ny, 24):
+        hole[r:r + 2, 6:42] = True
+    for c in range(6, 43, 12):
+        hole[:, c:c + 2] = True
+
+    shell, core, report = build_dual_cylinder(
+        hole, radius_mm=22.0, height_mm=35.0, wall_thickness_mm=2.0,
+        axis_diameter_mm=6.0, cut_through=True,
+    )
+    assert report["shell_bodies"] == 1, (
+        f"Schale zerfaellt in {report['shell_bodies']} lose Teile"
+    )
+    assert report["core_bodies"] == 1, (
+        f"Kern zerfaellt in {report['core_bodies']} lose Teile"
+    )
+    assert shell.is_watertight and core.is_watertight
+    print("PASS: Schale und Kern sind je genau ein zusammenhaengender Koerper")
+
+
 def run_self_tests():
     print("=== dual_cylinder_ejector.py: Selbsttest Grenzfaelle ===")
     _test_island_is_detected_and_fixed()
+    _test_enclosed_puzzle_segments_are_all_connected()
+    _test_closed_loop_around_circumference_is_reconnected()
+    _test_bridge_is_taken_to_the_nearest_neighbour_not_across_the_pattern()
     _test_boundary_touching_line_is_not_an_island()
     _test_severing_ring_is_detected_and_fixed()
     _test_wraparound_seam_is_one_component()
@@ -854,6 +1477,10 @@ def run_self_tests():
     _test_shell_and_core_do_not_overlap()
     _test_cap_triangulation_closes_star_shaped_ring()
     _test_seamless_tile_pattern_produces_watertight_overlap_free_result()
+    _test_shell_wall_is_full_thickness_and_core_is_solid()
+    _test_plugs_sit_in_the_holes_not_under_the_wall()
+    _test_plug_clearance_respects_the_theta_seam()
+    _test_result_is_a_single_body_per_part()
     print("=== Alle Tests bestanden ===")
 
 

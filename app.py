@@ -456,6 +456,20 @@ with st.sidebar:
                  "Schalen-Aussenflaeche zurueckgesetzt sind.",
             key="ejector_flush_offset",
         )
+        ejector_wall_thickness = st.slider(
+            "Wandstaerke der Schale (mm)", 0.8, 6.0, 2.0, 0.1,
+            help="Radiale Wandstaerke des Schalen-Rohrs. Die Wand steht "
+                 "ueberall in voller Staerke, nur die Loecher gehen durch -- "
+                 "davon haengt die Haltbarkeit der Schale ab.",
+            key="ejector_wall_thickness",
+        )
+        ejector_bridge_width = st.slider(
+            "Stegbreite fuer Verbindungen (px)", 1, 8, 2, 1,
+            help="Breite der Stege, mit denen eingeschlossene Segmente "
+                 "(z.B. Puzzleteil-Innenflaechen) an den Rest der Schale "
+                 "angebunden werden.",
+            key="ejector_bridge_width",
+        )
         if not create_axis_hole:
             st.warning("⚠️ Der Auswerfer benoetigt eine Achsbohrung ('Create hole for axis').")
 
@@ -626,10 +640,11 @@ with col1:
                         cut_mask,
                         radius_mm=radius,
                         height_mm=cylinder_height_mm,
-                        wall_thickness_mm=displacement,
+                        wall_thickness_mm=ejector_wall_thickness,
                         radial_clearance_mm=ejector_clearance,
                         flush_offset_mm=ejector_flush_offset,
                         axis_diameter_mm=axis_diameter,
+                        bridge_width_px=ejector_bridge_width,
                         cut_through=True,
                     )
                     st.session_state.shell_mesh = shell_mesh
@@ -644,17 +659,49 @@ with col1:
                             if ejector_report["severing_rings_found"]:
                                 st.warning(
                                     f"{len(ejector_report['severing_rings_found'])} Trennring(e) "
-                                    f"gefunden und mit Stegen repariert."
+                                    f"(voller Umlauf-Schnitt) gefunden und mit "
+                                    f"mehreren Stegen verstärkt."
                                 )
-                            if ejector_report["islands_found"]:
+                            components = ejector_report.get("components_found", 1)
+                            bridges = ejector_report.get("bridges_added", 0)
+                            if bridges:
                                 st.warning(
-                                    f"{ejector_report['islands_found']} freischwebende Insel(n) "
-                                    f"gefunden und automatisch angebunden."
+                                    f"{components} getrennte Musterteile gefunden "
+                                    f"(z.B. vollständig eingeschlossene Segmente) und "
+                                    f"mit {bridges} minimalen Stegen zu einem "
+                                    f"Körper verbunden."
                                 )
-                            if not ejector_report["severing_rings_found"] and not ejector_report["islands_found"]:
-                                st.info("Keine Trennringe oder Inseln im Muster gefunden.")
-                            st.metric("Überlappungsvolumen (Soll: 0)",
-                                      f"{ejector_report.get('overlap_volume_mm3', 0):.4f} mm³")
+                            elif not ejector_report["severing_rings_found"]:
+                                st.info(
+                                    "Muster war bereits zusammenhängend -- keine "
+                                    "Stege nötig."
+                                )
+                            if not ejector_report.get("single_body", True):
+                                st.error(
+                                    "Muster konnte nicht vollständig verbunden werden -- "
+                                    "es bleiben lose Teile übrig."
+                                )
+                            for warning in ejector_report.get("warnings", []):
+                                st.warning(warning)
+
+                            rep_col1, rep_col2, rep_col3 = st.columns(3)
+                            with rep_col1:
+                                st.metric("Überlappungsvolumen (Soll: 0)",
+                                          f"{ejector_report.get('overlap_volume_mm3', 0):.4f} mm³")
+                            with rep_col2:
+                                st.metric("Wandstärke Schale",
+                                          f"{ejector_report.get('shell_wall_thickness_mm', 0):.2f} mm")
+                            with rep_col3:
+                                st.metric("Kernwand (Achse → Mantel)",
+                                          f"{ejector_report.get('core_wall_thickness_mm', 0):.2f} mm")
+                            st.caption(
+                                f"Schale: {ejector_report.get('shell_bodies', '?')} Körper, "
+                                f"{ejector_report.get('shell_volume_mm3', float('nan')):.0f} mm³ · "
+                                f"Kern: {ejector_report.get('core_bodies', '?')} Körper, "
+                                f"{ejector_report.get('core_volume_mm3', float('nan')):.0f} mm³ "
+                                f"(Füllgrad {ejector_report.get('core_fill_ratio', float('nan')):.2f}, "
+                                f"1.0 = massiv)"
+                            )
                     else:
                         status_placeholder.error(
                             f"⚠️ Schale und Kern ueberlappen "
