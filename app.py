@@ -463,12 +463,20 @@ with st.sidebar:
                  "davon haengt die Haltbarkeit der Schale ab.",
             key="ejector_wall_thickness",
         )
-        ejector_bridge_width = st.slider(
-            "Stegbreite fuer Verbindungen (px)", 1, 8, 2, 1,
+        ejector_bridge_width_mm = st.slider(
+            "Stegbreite fuer Verbindungen (mm)", 0.4, 3.0, 1.0, 0.1,
             help="Breite der Stege, mit denen eingeschlossene Segmente "
                  "(z.B. Puzzleteil-Innenflaechen) an den Rest der Schale "
-                 "angebunden werden.",
-            key="ejector_bridge_width",
+                 "angebunden werden. In Millimetern, damit die Stege bei "
+                 "jeder DPI-Einstellung druckbar bleiben.",
+            key="ejector_bridge_width_mm",
+        )
+        ejector_min_feature_mm = st.slider(
+            "Kleinstes druckbares Detail (mm)", 0.0, 2.0, 0.8, 0.1,
+            help="Muster-Details unterhalb dieser Groesse werden entfernt "
+                 "(Materialfleckchen) bzw. gefuellt (Mini-Loecher), statt sie "
+                 "mit Stegen anzubinden. 0 = nichts entfernen.",
+            key="ejector_min_feature_mm",
         )
         if not create_axis_hole:
             st.warning("⚠️ Der Auswerfer benoetigt eine Achsbohrung ('Create hole for axis').")
@@ -644,7 +652,8 @@ with col1:
                         radial_clearance_mm=ejector_clearance,
                         flush_offset_mm=ejector_flush_offset,
                         axis_diameter_mm=axis_diameter,
-                        bridge_width_px=ejector_bridge_width,
+                        bridge_width_mm=ejector_bridge_width_mm,
+                        min_feature_mm=ejector_min_feature_mm,
                         cut_through=True,
                     )
                     st.session_state.shell_mesh = shell_mesh
@@ -681,6 +690,15 @@ with col1:
                                     "Muster konnte nicht vollständig verbunden werden -- "
                                     "es bleiben lose Teile übrig."
                                 )
+                            specks = (ejector_report.get("material_specks_removed", 0)
+                                      + ejector_report.get("hole_specks_filled", 0))
+                            if specks:
+                                st.info(
+                                    f"{ejector_report.get('material_specks_removed', 0)} zu kleine "
+                                    f"Materialfleckchen entfernt und "
+                                    f"{ejector_report.get('hole_specks_filled', 0)} Mini-Löcher "
+                                    f"gefüllt (nicht druckbare Details)."
+                                )
                             for warning in ejector_report.get("warnings", []):
                                 st.warning(warning)
 
@@ -694,6 +712,12 @@ with col1:
                             with rep_col3:
                                 st.metric("Kernwand (Achse → Mantel)",
                                           f"{ejector_report.get('core_wall_thickness_mm', 0):.2f} mm")
+                            st.caption(
+                                f"Stopfen-Abdeckung der Lochfläche: "
+                                f"{ejector_report.get('plug_coverage', 0) * 100:.0f} % · "
+                                f"Stegbreite: {ejector_report.get('bridge_width_px', ('?', '?'))} px "
+                                f"(θ, z)"
+                            )
                             st.caption(
                                 f"Schale: {ejector_report.get('shell_bodies', '?')} Körper, "
                                 f"{ejector_report.get('shell_volume_mm3', float('nan')):.0f} mm³ · "

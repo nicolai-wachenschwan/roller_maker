@@ -71,7 +71,13 @@ Die allgemeine Verbindungsstrategie
 ------------------------------------
 Fuer alle diese Faelle wird dieselbe Strategie benutzt (Abschnitt 4):
 
-  1. Jedes Materialfragment ist ein Knoten eines Graphen.
+  0. VORHER AUFRAEUMEN: Details, die kleiner sind als das kleinste
+     druckbare Feature, werden entfernt (Materialfleckchen) bzw. gefuellt
+     (Mini-Loecher). Die richtige Antwort auf einen 3-Pixel-Fleck ist
+     Loeschen, nicht Verbinden -- ein Steg dorthin waere laenger als der
+     Fleck selbst und wuerde echtes Muster zerstoeren, um etwas zu retten,
+     das der Drucker gar nicht darstellen kann.
+  1. Jedes verbleibende Materialfragment ist ein Knoten eines Graphen.
   2. Zwischen benachbarten Fragmenten liegt eine Kante mit dem Gewicht des
      KUERZEST MOEGLICHEN Stegs zwischen ihnen. Die Kandidaten liefert die
      Feature-Transformation der Distanztransformation: an der
@@ -82,14 +88,43 @@ Fuer alle diese Faelle wird dieselbe Strategie benutzt (Abschnitt 4):
      insgesamt kuerzesten, also mit dem geringstmoeglichen Eingriff ins
      Schnittmuster und ohne einen einzigen ueberfluessigen Steg.
 
-Weil verschachtelte Fragmente so an ihren direkten NACHBARN haengen (und
-nicht einzeln quer durch das ganze Muster zu einem "verankerten" Bereich
-gezogen werden), skaliert das auch fuer Muster mit hunderten
-eingeschlossenen Segmenten.
+Warum das vollstaendig ist (und nicht nur "meistens klappt")
+--------------------------------------------------------------
+Die Owner-Karte aus Schritt 2 ist eine Voronoi-Zerlegung des Bildes: jedes
+Pixel gehoert zu dem Fragment, das ihm am naechsten liegt. Ein Bild ist ein
+zusammenhaengendes Gebiet, und die Regionen-Nachbarschaft einer Zerlegung
+eines zusammenhaengenden Gebiets ist selbst wieder zusammenhaengend. Der
+Kandidatengraph ist also IMMER zusammenhaengend -- damit existiert immer
+ein Spannbaum, und der Algorithmus kann nicht in einen Zustand geraten, in
+dem er ein Fragment nicht anbinden koennte. Er terminiert nach einer Runde
+(Stege fuegen nur Material hinzu, koennen den Zusammenhang also nur
+verbessern), und das Ergebnis wird trotzdem nachgeprueft.
+
+Zwei Feinheiten, ohne die die Strategie nur auf dem Papier stimmt:
+
+- KONNEKTIVITAET: als "verbunden" gilt nur die 4er-Nachbarschaft. Zwei
+  Pixel, die sich nur ueber eine Ecke beruehren, sind im gedruckten Teil
+  kein Verbund, sondern ein Scharnier mit Querschnitt null. Wer die
+  8er-Nachbarschaft nimmt, erklaert genau diese Sollbruchstellen fuer in
+  Ordnung. Entsprechend muss auch der gezeichnete Steg selbst
+  4-zusammenhaengend sein (keine rein diagonalen Schritte).
+- STEGQUERSCHNITT: die Stege werden in MILLIMETERN bemessen und in BEIDEN
+  Achsen dilatiert. Verbreitert man einen Steg nur in theta-Richtung, dann
+  wird ein Steg, der selbst in theta-Richtung laeuft, davon nicht dicker,
+  sondern nur laenger -- er bleibt ein Pixel duenn und damit undruckbar.
+
+Weil verschachtelte Fragmente an ihren direkten NACHBARN haengen (und nicht
+einzeln quer durch das ganze Muster zu einem "verankerten" Bereich gezogen
+werden), skaliert das auch fuer Muster mit hunderten eingeschlossenen
+Segmenten: Kandidatensuche und Spannbaum sind linear bzw. n log n in der
+Fragmentzahl, nicht quadratisch.
 
 Ein voller Umlauf-Schnitt bekommt zusaetzlich mehrere, ueber den Umfang
 verteilte Stege: ein einzelner minimaler Steg wuerde die beiden Haelften
 des Zylinders zwar topologisch verbinden, aber mechanisch nicht tragen.
+Das ist die einzige Stelle, an der bewusst MEHR als das topologische
+Minimum gebaut wird -- Topologie und Mechanik sind eben zwei verschiedene
+Anforderungen.
 
 Haltbarkeit: Wandstaerken statt Haut
 --------------------------------------
@@ -148,13 +183,28 @@ def image_to_cut_mask(img_array: np.ndarray, threshold: int) -> np.ndarray:
 # 2. Periodische Konnektivitaetsanalyse (theta-Achse umlaufend)
 # ---------------------------------------------------------------------------
 
-def label_periodic_theta(mask: np.ndarray):
+# Konnektivitaet der STRUKTUR-Analyse: 1 == 4er-Nachbarschaft.
+#
+# Bewusst NICHT die 8er-Nachbarschaft: zwei Pixel, die sich nur ueber eine
+# ECKE beruehren, sind im gedruckten Teil kein Verbund, sondern ein Scharnier
+# mit der Querschnittsflaeche null -- es bricht beim ersten Gebrauch. Wer
+# diagonal "verbunden" gelten laesst, liefert genau solche Sollbruchstellen
+# aus. Mit der 4er-Nachbarschaft gilt ein Eckkontakt als getrennt und
+# bekommt vom Spannbaum (Abschnitt 4) einen echten, breiten Steg.
+STRUCTURAL_CONNECTIVITY = 1
+
+
+def label_periodic_theta(mask: np.ndarray, connectivity: int = STRUCTURAL_CONNECTIVITY):
     """Wie scipy.ndimage.label, aber axis 0 (theta) ist umlaufend.
+
+    connectivity: 1 == 4er-Nachbarschaft (Standard, siehe
+    STRUCTURAL_CONNECTIVITY), 2 == 8er-Nachbarschaft (fuer die Loch-Phase,
+    die in der digitalen Topologie das duale Paar zur Material-Phase bildet).
 
     Gibt (labels, num_labels) zurueck; labels==0 ist Hintergrund (kein Material
     an dieser Stelle in der jeweils analysierten Maske).
     """
-    structure = np.ones((3, 3), dtype=int)  # 8-Konnektivitaet
+    structure = ndimage.generate_binary_structure(2, connectivity)
     labels, num = ndimage.label(mask, structure=structure)
     if num == 0:
         return labels, 0
@@ -163,11 +213,13 @@ def label_periodic_theta(mask: np.ndarray):
     ny, nx = mask.shape
     top_row, bot_row = labels[0, :], labels[-1, :]
 
-    # Nachbarschaft ueber die Naht theta=0 <-> theta=ny-1, inkl. Diagonalen
+    # Nachbarschaft ueber die Naht theta=0 <-> theta=ny-1; die Diagonalen
+    # nur, wenn auch sonst 8er-Nachbarschaft gilt.
+    offsets = (-1, 0, 1) if connectivity >= 2 else (0,)
     for c in range(nx):
         if top_row[c] == 0 and bot_row[c] == 0:
             continue
-        for dc in (-1, 0, 1):
+        for dc in offsets:
             c2 = c + dc
             if 0 <= c2 < nx:
                 a, b = bot_row[c], top_row[c2]
@@ -332,6 +384,63 @@ def fix_severing_rings(hole_mask: np.ndarray, severing_cols: list[int],
 # theta-Naht hinweg.
 
 
+def remove_unprintable_specks(hole_mask: np.ndarray, min_area_px: int
+                              ) -> tuple[np.ndarray, dict]:
+    """Entfernt Muster-Details, die kleiner sind als das, was der Drucker
+    ueberhaupt darstellen kann.
+
+    WARUM DAS VOR DIE VERBINDUNGSSTRATEGIE GEHOERT: ein 3-Pixel-Fleck ist
+    kein Bauteil, sondern Bildrauschen. Ihn anzubinden kostet einen Steg,
+    der laenger ist als der Fleck selbst -- man beschaedigt also echtes
+    Schnittmuster, um etwas zu retten, das ohnehin nicht druckbar ist. Die
+    richtige Antwort auf einen Fleck ist Loeschen, nicht Verbinden. Genauso
+    fuer Loch-Flecken: ein Loch unterhalb der Duesenbreite wird beim Drucken
+    ohnehin zugeschmolzen und wuerde nur einen unbrauchbaren Mini-Stopfen
+    auf dem Kern erzeugen.
+
+    Beide Phasen werden dabei in ihrer jeweils passenden Konnektivitaet
+    betrachtet (Material 4er, Loch 8er -- das duale Paar der digitalen
+    Topologie), damit das Entfernen keine neuen Scheinverbindungen erzeugt.
+
+    Die groesste Materialkomponente bleibt IMMER erhalten, auch wenn sie
+    unter der Schwelle liegt -- sonst koennte ein extremes Bild die Schale
+    komplett ausloeschen.
+    """
+    info = {"material_specks_removed": 0, "hole_specks_filled": 0,
+            "speck_pixels_removed": 0, "speck_pixels_filled": 0}
+    working = hole_mask.copy()
+    if min_area_px <= 1:
+        return working, info
+
+    # -- Material-Flecken zu Loch machen --
+    labels, num = label_periodic_theta(~working)
+    if num > 0:
+        sizes = np.bincount(labels.ravel(), minlength=num + 1)
+        sizes[0] = 0
+        largest = int(np.argmax(sizes))
+        small = np.where(sizes < min_area_px)[0]
+        small = small[(small != 0) & (small != largest)]
+        if small.size:
+            victim = np.isin(labels, small)
+            info["material_specks_removed"] = int(small.size)
+            info["speck_pixels_removed"] = int(victim.sum())
+            working[victim] = True
+
+    # -- Loch-Flecken auffuellen (Loch-Phase: 8er-Konnektivitaet) --
+    labels_h, num_h = label_periodic_theta(working, connectivity=2)
+    if num_h > 0:
+        sizes_h = np.bincount(labels_h.ravel(), minlength=num_h + 1)
+        sizes_h[0] = 0
+        small_h = np.where((sizes_h < min_area_px) & (sizes_h > 0))[0]
+        if small_h.size:
+            victim = np.isin(labels_h, small_h)
+            info["hole_specks_filled"] = int(small_h.size)
+            info["speck_pixels_filled"] = int(victim.sum())
+            working[victim] = False
+
+    return working, info
+
+
 def find_material_components(hole_mask: np.ndarray):
     """(labels, num) der Materialfragmente, theta periodisch."""
     return label_periodic_theta(~hole_mask)
@@ -365,9 +474,17 @@ def _shortest_bridge_candidates(material: np.ndarray, labels: np.ndarray,
 
     # Nachbarpaare: in theta (periodisch, deshalb reicht +1 im gekachelten
     # Raum) und in z (nicht periodisch -> letzte Spalte auslassen)
+    # Nachbarpaare der Owner-Karte in allen vier Richtungen (inkl. der
+    # Diagonalen). Die Diagonalen sind nicht optional: zwei Fragmente, die
+    # sich nur ueber eine Ecke beruehren, haben ZWISCHEN sich keine zwei
+    # achsparallel benachbarten Loch-Pixel -- ohne die diagonale Abfrage
+    # entstuende fuer sie ueberhaupt kein Kandidat und der Spannbaum koennte
+    # sie nicht verbinden.
     pair_sets = [
         (rr, cc, rr + 1, cc),
         (rr[:, :-1], cc[:, :-1], rr[:, :-1], cc[:, :-1] + 1),
+        (rr[:, :-1], cc[:, :-1], rr[:, :-1] + 1, cc[:, :-1] + 1),
+        (rr[:, 1:], cc[:, 1:], rr[:, 1:] + 1, cc[:, 1:] - 1),
     ]
 
     w_all, a_all, b_all = [], [], []
@@ -424,9 +541,15 @@ def _shortest_bridge_candidates(material: np.ndarray, labels: np.ndarray,
 
 def connect_material_components(hole_mask: np.ndarray,
                                  bridge_width_px: int = 2,
+                                 bridge_width_z_px: int | None = None,
                                  max_rounds: int = 3) -> tuple[np.ndarray, dict]:
     """Verbindet ALLE Materialfragmente zu genau einem Koerper -- ueber einen
     minimalen Spannbaum der kuerzest moeglichen Stege (siehe Konzept oben).
+
+    bridge_width_px / bridge_width_z_px sind die Stegbreiten in theta- bzw.
+    z-Richtung. Beide werden gebraucht: ein Steg, der in theta-Richtung
+    laeuft, wird durch eine Verbreiterung in theta nicht dicker, sondern nur
+    laenger -- er bliebe ein Pixel duenn (siehe _dilate_bridges).
 
     Gibt (reparierte Maske, Info-Dict) zurueck.
     """
@@ -440,6 +563,8 @@ def connect_material_components(hole_mask: np.ndarray,
     }
     repaired = hole_mask.copy()
     ny, nx = repaired.shape
+    w_theta = max(1, int(bridge_width_px))
+    w_z = max(1, int(bridge_width_z_px if bridge_width_z_px is not None else bridge_width_px))
 
     labels, num = find_material_components(repaired)
     info["components_before"] = num
@@ -463,16 +588,19 @@ def connect_material_components(hole_mask: np.ndarray,
         # Kruskal: kuerzeste Stege zuerst, nur behalten was wirklich verbindet
         candidates.sort(key=lambda e: e[0])
         uf = _UnionFind(num + 1)
+        path_canvas = np.zeros_like(repaired)
         for length, a, b, pa, pb in candidates:
             if uf.find(a) == uf.find(b):
                 continue
             uf.union(a, b)
-            _draw_bridge(repaired, pa[0], pa[1], pb[0], pb[1], ny,
-                         bridge_width_px)
+            for r, c in _bridge_path(pa[0], pa[1], pb[0], pb[1], ny):
+                path_canvas[r % ny, c] = True
             info["bridges"].append({
                 "from": a, "to": b, "length_px": length,
                 "at": (pa, pb),
             })
+
+        repaired[_dilate_bridges(path_canvas, w_theta, w_z)] = False
 
         labels, num = find_material_components(repaired)
         if num <= 1:
@@ -530,27 +658,56 @@ def find_material_islands(hole_mask: np.ndarray):
     return islands, labels
 
 
-def _draw_bridge(mask: np.ndarray, r0: int, c0: int, r1: int, c1: int,
-                  ny: int, width_px: int):
-    """Zeichnet eine gerade Verbindung (Bresenham) zwischen zwei Punkten und
-    setzt mask=False (== Material) entlang der Linie, inkl. periodischem
-    Wrap in theta-Richtung (waehlt den kuerzeren Weg um den Umfang)."""
-    # kuerzeren Weg in theta-Richtung waehlen (kann ueber die Naht laufen)
+def _dilate_bridges(path_canvas: np.ndarray, width_theta_px: int,
+                     width_z_px: int) -> np.ndarray:
+    """Verbreitert die (ein Pixel duennen) Steg-Pfade auf ihre Sollbreite.
+
+    WICHTIG -- warum das eine Dilatation in BEIDEN Achsen sein muss: die
+    Vorgaengerversion hat den Steg nur in theta-Richtung verbreitert. Fuer
+    einen Steg, der selbst in theta-Richtung laeuft, liegt diese
+    "Verbreiterung" genau auf seiner eigenen Laufrichtung -- er wurde damit
+    nicht dicker, sondern nur laenger und blieb in z-Richtung EIN Pixel
+    breit (bei 150 dpi also 0,17 mm: nicht druckbar). Eine Dilatation mit
+    einem Rechteck (theta x z) gibt dem Steg dagegen unabhaengig von seiner
+    Richtung ueberall den geforderten Querschnitt.
+
+    Die theta-Achse wird dabei umlaufend gepolstert, damit ein Steg an der
+    Naht nicht abgeschnitten wird.
+    """
+    if not path_canvas.any():
+        return path_canvas
+    ht = max(0, (int(width_theta_px) - 1) // 2)
+    hz = max(0, (int(width_z_px) - 1) // 2)
+    if ht == 0 and hz == 0:
+        return path_canvas
+    struct = np.ones((2 * ht + 1, 2 * hz + 1), dtype=bool)
+    padded = np.pad(path_canvas, ((ht, ht), (0, 0)), mode="wrap")
+    grown = ndimage.binary_dilation(padded, structure=struct)
+    return grown[ht:ht + path_canvas.shape[0], :]
+
+
+def _bridge_path(r0: int, c0: int, r1: int, c1: int, ny: int):
+    """Pixelpfad eines Stegs zwischen zwei Punkten, periodisch in theta
+    (waehlt den kuerzeren Weg um den Umfang).
+
+    Der Pfad ist bewusst 4-ZUSAMMENHAENGEND (nie nur diagonal weiter): ein
+    diagonaler Schritt waere im Druck wieder nur ein Eckkontakt -- also
+    genau die Sollbruchstelle, die der Steg beseitigen soll. Damit ist auch
+    garantiert, dass der gezeichnete Steg die beiden Fragmente unter dem
+    4er-Kriterium (STRUCTURAL_CONNECTIVITY) wirklich verbindet, selbst wenn
+    die Stegbreite nur ein Pixel betraegt.
+    """
     diff = r1 - r0
     if abs(diff) > ny / 2:
         if diff > 0:
             r1 -= ny
         else:
             r1 += ny
-
-    half = max(width_px, 1) // 2
-    for r, c in _bresenham(r0, c0, r1, c1):
-        rr = r % ny
-        for d in range(-half, half + 1):
-            mask[(rr + d) % ny, c] = False
+    return _line_pixels_4connected(r0, c0, r1, c1)
 
 
-def _bresenham(r0, c0, r1, c1):
+def _line_pixels_4connected(r0, c0, r1, c1):
+    """Bresenham, aber mit Zwischenpixel bei diagonalen Schritten."""
     points = []
     dr, dc = abs(r1 - r0), abs(c1 - c0)
     sr = 1 if r1 > r0 else -1
@@ -562,12 +719,18 @@ def _bresenham(r0, c0, r1, c1):
         if r == r1 and c == c1:
             break
         e2 = 2 * err
-        if e2 > -dc:
+        step_r = e2 > -dc
+        step_c = e2 < dr
+        if step_r:
             err -= dc
             r += sr
-        if e2 < dr:
+        if step_c:
             err += dr
             c += sc
+            if step_r:
+                # diagonaler Schritt -> Zwischenpixel einfuegen, damit der
+                # Pfad nirgends nur ueber eine Ecke weiterlaeuft
+                points.append((r, c - sc))
     return points
 
 
@@ -575,17 +738,37 @@ def _bresenham(r0, c0, r1, c1):
 # 5. Orchestrierung: Maske reparieren
 # ---------------------------------------------------------------------------
 
+def _px_from_mm(value_mm: float, pitch_mm: float | None, fallback_px: int) -> int:
+    """Rechnet eine physikalische Groesse in Pixel um, sofern die
+    Pixelteilung bekannt ist -- sonst bleibt es beim Pixel-Vorgabewert."""
+    if value_mm is None or pitch_mm is None or pitch_mm <= 0:
+        return max(1, int(fallback_px))
+    return max(1, int(np.ceil(value_mm / pitch_mm)))
+
+
 def repair_cut_mask(hole_mask: np.ndarray, bridge_width_px: int = 2,
                      severing_tab_width_px: int = 3,
-                     severing_n_tabs: int = 2) -> tuple[np.ndarray, dict]:
+                     severing_n_tabs: int = 2,
+                     pixel_pitch_theta_mm: float | None = None,
+                     pixel_pitch_z_mm: float | None = None,
+                     bridge_width_mm: float | None = None,
+                     min_feature_mm: float | None = None,
+                     ) -> tuple[np.ndarray, dict]:
     """Macht aus einer beliebigen Lochmaske eine druckbare Lochmaske.
 
-    Reihenfolge:
-      1. Trenn-Ringe (volle Umlauf-Schnitte) mit mehreren Stegen verstaerken
+    Reihenfolge (jeder Schritt macht den naechsten billiger):
+      1. Nicht druckbare Flecken entfernen -- Material-Flecken werden zu
+         Loch, Loch-Flecken werden gefuellt. Ein Fleck wird geloescht, nicht
+         angebunden (siehe remove_unprintable_specks).
+      2. Trenn-Ringe (volle Umlauf-Schnitte) mit mehreren Stegen verstaerken
          -- rein strukturell, damit ein durchtrennter Zylinder nicht nur an
          einem einzigen duennen Steg haengt.
-      2. Allgemeine Verbindungsstrategie: minimaler Spannbaum ueber alle
+      3. Allgemeine Verbindungsstrategie: minimaler Spannbaum ueber alle
          Materialfragmente -> genau ein zusammenhaengender Koerper.
+
+    Sind die Pixelteilungen bekannt, werden Stegbreite und Mindest-Feature
+    in MILLIMETERN bemessen (und pro Achse getrennt in Pixel umgerechnet) --
+    sonst gelten die Pixel-Vorgabewerte.
 
     Gibt (reparierte Maske, Report) zurueck.
     """
@@ -596,14 +779,28 @@ def repair_cut_mask(hole_mask: np.ndarray, bridge_width_px: int = 2,
         "island_details": [],
     }
 
+    bridge_theta_px = _px_from_mm(bridge_width_mm, pixel_pitch_theta_mm, bridge_width_px)
+    bridge_z_px = _px_from_mm(bridge_width_mm, pixel_pitch_z_mm, bridge_width_px)
+    report["bridge_width_px"] = (bridge_theta_px, bridge_z_px)
+
     working = hole_mask.copy()
 
+    # -- 1. nicht druckbare Flecken --
+    min_area_px = 0
+    if (min_feature_mm and pixel_pitch_theta_mm and pixel_pitch_z_mm
+            and pixel_pitch_theta_mm > 0 and pixel_pitch_z_mm > 0):
+        pixel_area = pixel_pitch_theta_mm * pixel_pitch_z_mm
+        min_area_px = int(round(min_feature_mm ** 2 / pixel_area))
+    working, speck_info = remove_unprintable_specks(working, min_area_px)
+    report.update(speck_info)
+    report["min_feature_area_px"] = min_area_px
+
+    # -- 2. Trenn-Ringe verstaerken --
     severing = find_severing_rings(working)
     report["severing_rings_found"] = severing
     if severing:
-        working = fix_severing_rings(
-            working, severing, severing_tab_width_px, severing_n_tabs
-        )
+        tab_px = _px_from_mm(bridge_width_mm, pixel_pitch_theta_mm, severing_tab_width_px)
+        working = fix_severing_rings(working, severing, tab_px, severing_n_tabs)
         report["severing_rings_fixed"] = True
 
     islands, _ = find_material_islands(working)
@@ -612,8 +809,9 @@ def repair_cut_mask(hole_mask: np.ndarray, bridge_width_px: int = 2,
         {"size": v["size"], "centroid": v["centroid"]} for v in islands.values()
     ]
 
+    # -- 3. Spannbaum --
     working, connect_info = connect_material_components(
-        working, bridge_width_px=bridge_width_px
+        working, bridge_width_px=bridge_theta_px, bridge_width_z_px=bridge_z_px
     )
     report["components_found"] = connect_info["components_before"]
     report["bridges_added"] = len(connect_info["bridges"])
@@ -841,6 +1039,8 @@ def build_dual_cylinder(
     cut_through: bool = True,
     verify_no_overlap: bool = True,
     min_core_wall_mm: float = 2.0,
+    bridge_width_mm: float = 1.0,
+    min_feature_mm: float = 0.8,
 ) -> tuple[trimesh.Trimesh, trimesh.Trimesh, dict]:
     """Erzeugt Schale (Rohr mit Loechern) und Kern (Vollzylinder mit
     Stopfen) fuer das Rotations-Auswerfer-Konzept.
@@ -865,7 +1065,25 @@ def build_dual_cylinder(
     Stopfen -- sie wird zusaetzlich per Boolean nachgerechnet.
     """
     ny, nx = cut_mask.shape
-    repaired_mask, report = repair_cut_mask(cut_mask, bridge_width_px=bridge_width_px)
+    if ny < 3 or nx < 2:
+        raise ValueError(
+            f"Maske ist zu klein fuer eine Geometrie: {cut_mask.shape} "
+            f"(mindestens 3 x 2 Pixel)."
+        )
+
+    # Die Maskenreparatur braucht die physikalische Pixelteilung, um
+    # Stegbreite und Mindest-Feature in Millimetern statt in Pixeln
+    # bemessen zu koennen -- sonst haengt die Druckbarkeit an der DPI-Wahl.
+    pitch_theta_mm = 2 * np.pi * float(radius_mm) / ny
+    pitch_z_mm = float(height_mm) / max(nx - 1, 1)
+    repaired_mask, report = repair_cut_mask(
+        cut_mask,
+        bridge_width_px=bridge_width_px,
+        pixel_pitch_theta_mm=pitch_theta_mm,
+        pixel_pitch_z_mm=pitch_z_mm,
+        bridge_width_mm=bridge_width_mm,
+        min_feature_mm=min_feature_mm,
+    )
 
     r_out = float(radius_mm)
     r_in = r_out - float(wall_thickness_mm)
@@ -893,9 +1111,25 @@ def build_dual_cylinder(
             f"(< 1 mm ~ 2 Perimeter) -- geringe Haltbarkeit."
         )
 
-    circumference_mm = 2 * np.pi * r_out
-    pixel_pitch_theta_mm = circumference_mm / ny
-    pixel_pitch_z_mm = height_mm / max(nx - 1, 1)
+    # Entartete Muster: die Geometrie kommt trotzdem heraus, aber sie ist
+    # dann funktionslos -- das darf nicht stillschweigend passieren.
+    hole_fraction = float(repaired_mask.mean())
+    report["hole_fraction"] = hole_fraction
+    if hole_fraction == 0.0:
+        warnings.append(
+            "Das Muster enthaelt keine Loecher -- die Schale kann nichts "
+            "ausstechen und der Kern bekommt keine Stopfen. Schwellwert "
+            "erhoehen."
+        )
+    elif hole_fraction > 0.9:
+        warnings.append(
+            f"{hole_fraction * 100:.0f} % der Flaeche sind Loch -- von der "
+            f"Schale bleibt fast nur noch das Stegwerk uebrig. Schwellwert "
+            f"senken."
+        )
+
+    pixel_pitch_theta_mm = pitch_theta_mm
+    pixel_pitch_z_mm = pitch_z_mm
 
     # --- Kern: massiver Zylinder mit Stopfen IN den Loechern der Schale ---
     plug_mask = _plug_mask_for_clearance(
@@ -947,6 +1181,18 @@ def build_dual_cylinder(
         report["axis_hole_cut_shell"] = False
 
     report["plug_pixels"] = int(plug_mask.sum())
+    hole_px = int(repaired_mask.sum())
+    # Anteil der Lochflaeche, der tatsaechlich einen Stopfen bekommt: Loecher,
+    # die schmaler sind als das doppelte Bewegungsspiel, bleiben ohne Stopfen
+    # und damit ohne Auswurfwirkung.
+    report["plug_coverage"] = (report["plug_pixels"] / hole_px) if hole_px else 0.0
+    if hole_px and report["plug_coverage"] < 0.5:
+        warnings.append(
+            f"Nur {report['plug_coverage'] * 100:.0f} % der Lochflaeche bekommen "
+            f"einen Auswerfer-Stopfen -- die Loecher sind im Verhaeltnis zum "
+            f"Bewegungsspiel ({radial_clearance_mm} mm) zu schmal. Spiel "
+            f"verkleinern oder Muster groeber waehlen."
+        )
     report["radii_mm"] = {
         "shell_outer": r_out,
         "shell_inner": r_in,
@@ -1106,6 +1352,142 @@ def _test_bridge_is_taken_to_the_nearest_neighbour_not_across_the_pattern():
     print(
         f"PASS: Verschachtelte Fragmente werden nachbarschaftlich verbunden "
         f"({report['bridge_pixels_added']} Steg-Pixel)"
+    )
+
+
+def _test_corner_contact_is_not_accepted_as_a_connection():
+    """Zwei Fragmente, die sich nur ueber eine ECKE beruehren, sind im Druck
+    kein Verbund, sondern ein Scharnier mit Querschnitt null. Das
+    Struktur-Kriterium arbeitet deshalb mit 4er-Nachbarschaft und laesst den
+    Spannbaum dort einen echten Steg setzen."""
+    hole = np.ones((20, 20), dtype=bool)
+    hole[5:9, 5:9] = False
+    hole[9:13, 9:13] = False   # beruehrt den ersten Klotz nur ueber die Ecke
+
+    _, num_8 = label_periodic_theta(~hole, connectivity=2)
+    _, num_4 = label_periodic_theta(~hole, connectivity=1)
+    assert num_8 == 1 and num_4 == 2, (
+        f"Testfall trifft den Eckkontakt nicht (8er: {num_8}, 4er: {num_4})"
+    )
+
+    repaired, report = repair_cut_mask(hole)
+    assert report["components_found"] >= 2
+    assert report["bridges_added"] >= 1, "Eckkontakt blieb ohne echten Steg"
+    _, num_after = label_periodic_theta(~repaired, connectivity=1)
+    assert num_after == 1
+    print("PASS: Reiner Eckkontakt wird als Trennung gewertet und echt ueberbrueckt")
+
+
+def _test_bridge_keeps_its_cross_section_in_both_directions():
+    """Ein Steg, der in theta-Richtung laeuft, darf nicht dadurch 'verbreitert'
+    werden, dass man ihn in genau dieser Richtung verbreitert -- dann bleibt
+    er ein Pixel duenn (bei 150 dpi 0,17 mm: nicht druckbar). Die Dilatation
+    muss in BEIDEN Achsen wirken."""
+    ny, nx = 40, 30
+    hole = np.ones((ny, nx), dtype=bool)
+    hole[0:6, 5:25] = False     # Materialband A
+    hole[20:26, 5:25] = False   # Materialband B -> Steg muss quer durch theta
+
+    pitch = 0.2  # mm/px in beiden Achsen
+    repaired, report = repair_cut_mask(
+        hole, pixel_pitch_theta_mm=pitch, pixel_pitch_z_mm=pitch,
+        bridge_width_mm=1.0, min_feature_mm=0.0,
+    )
+    expected_px = int(np.ceil(1.0 / pitch))
+    assert report["bridge_width_px"] == (expected_px, expected_px)
+
+    added = hole & ~repaired
+    # Der Steg selbst laeuft zwischen den beiden Baendern (theta 6..19).
+    between = added[6:20, :]
+    assert between.any(), "Kein Steg zwischen den Baendern gefunden"
+    # In jeder theta-Zeile, die der Steg durchquert, muss er mindestens
+    # (Sollbreite - 2) Pixel in z-Richtung breit sein.
+    widths = between.sum(axis=1)
+    crossed = widths[widths > 0]
+    assert crossed.min() >= expected_px - 2, (
+        f"Steg ist in z-Richtung nur {crossed.min()} px breit, erwartet "
+        f"~{expected_px} px -- die Verbreiterung wirkt nur in Laufrichtung"
+    )
+    print(
+        f"PASS: Steg quer zu theta behaelt seinen Querschnitt "
+        f"({crossed.min()} px in z bei Sollbreite {expected_px} px)"
+    )
+
+
+def _test_unprintable_specks_are_removed_instead_of_bridged():
+    """Ein Fleck unterhalb der druckbaren Groesse wird geloescht, nicht
+    angebunden: ein Steg dorthin waere laenger als der Fleck selbst und
+    wuerde echtes Schnittmuster zerstoeren, um etwas zu retten, das der
+    Drucker gar nicht darstellen kann."""
+    ny, nx = 80, 60
+    hole = np.zeros((ny, nx), dtype=bool)
+    hole[10:70, 10:50] = True        # grosses Lochfeld
+    hole[38:42, 28:32] = False       # 4x4-Fleck mitten drin
+    hole[20:34, 20:40] = False       # grosses, ebenfalls eingeschlossenes Segment
+
+    pitch = 0.2
+    # 0.8 mm Mindest-Feature -> 16 px Flaeche: der 4x4-Fleck (16 px) faellt
+    # knapp NICHT weg, ein 3x3-Fleck (9 px) schon. Also mit 1.0 mm testen.
+    repaired, report = repair_cut_mask(
+        hole, pixel_pitch_theta_mm=pitch, pixel_pitch_z_mm=pitch,
+        bridge_width_mm=0.4, min_feature_mm=1.0,
+    )
+    assert report["material_specks_removed"] >= 1, "Fleck wurde nicht entfernt"
+    assert repaired[38:42, 28:32].all(), "Fleck ist immer noch Material"
+    # Das grosse Segment wird dagegen angebunden, nicht geloescht.
+    assert not repaired[24:30, 26:34].all(), "Grosses Segment wurde geloescht"
+    assert report["single_body"]
+    print(
+        f"PASS: {report['material_specks_removed']} nicht druckbare(r) Fleck(en) "
+        f"entfernt statt angebunden, grosse Segmente angebunden"
+    )
+
+
+def _test_degenerate_masks_are_reported_not_silently_built():
+    """Ein Schwellwert, der alles oder nichts schneidet, liefert zwar noch
+    eine Geometrie -- aber eine funktionslose. Das muss im Report stehen."""
+    all_material = np.zeros((40, 30), dtype=bool)
+    _, _, rep_a = build_dual_cylinder(
+        all_material, radius_mm=20.0, height_mm=30.0, wall_thickness_mm=2.0,
+        axis_diameter_mm=None, cut_through=False, verify_no_overlap=False,
+    )
+    assert any("keine Loecher" in w for w in rep_a["warnings"]), rep_a["warnings"]
+    assert rep_a["hole_fraction"] == 0.0
+
+    all_hole = np.ones((40, 30), dtype=bool)
+    _, _, rep_b = build_dual_cylinder(
+        all_hole, radius_mm=20.0, height_mm=30.0, wall_thickness_mm=2.0,
+        axis_diameter_mm=None, cut_through=False, verify_no_overlap=False,
+    )
+    assert any("Loch" in w for w in rep_b["warnings"]), rep_b["warnings"]
+
+    try:
+        build_dual_cylinder(np.zeros((2, 1), dtype=bool), radius_mm=20.0,
+                            height_mm=30.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Zu kleine Maske haette abgelehnt werden muessen")
+    print("PASS: Entartete Eingaben werden gemeldet statt stillschweigend gebaut")
+
+
+def _test_plug_coverage_is_reported_for_fine_patterns():
+    """Loecher, die schmaler sind als das doppelte Bewegungsspiel, bekommen
+    keinen Stopfen -- der Auswerfer haette dort keine Wirkung. Das darf nicht
+    unbemerkt bleiben."""
+    ny, nx = 120, 90
+    hole = np.zeros((ny, nx), dtype=bool)
+    hole[::10, 10:80] = True      # sehr feine Linien (1 px)
+
+    _, _, report = build_dual_cylinder(
+        hole, radius_mm=30.0, height_mm=45.0, wall_thickness_mm=2.0,
+        radial_clearance_mm=0.4, axis_diameter_mm=6.0, cut_through=True,
+    )
+    assert report["plug_coverage"] < 0.5
+    assert any("Stopfen" in w for w in report["warnings"]), report["warnings"]
+    print(
+        f"PASS: Zu feines Muster wird gemeldet "
+        f"(Stopfen-Abdeckung {report['plug_coverage'] * 100:.0f} %)"
     )
 
 
@@ -1470,6 +1852,11 @@ def run_self_tests():
     _test_enclosed_puzzle_segments_are_all_connected()
     _test_closed_loop_around_circumference_is_reconnected()
     _test_bridge_is_taken_to_the_nearest_neighbour_not_across_the_pattern()
+    _test_corner_contact_is_not_accepted_as_a_connection()
+    _test_bridge_keeps_its_cross_section_in_both_directions()
+    _test_unprintable_specks_are_removed_instead_of_bridged()
+    _test_degenerate_masks_are_reported_not_silently_built()
+    _test_plug_coverage_is_reported_for_fine_patterns()
     _test_boundary_touching_line_is_not_an_island()
     _test_severing_ring_is_detected_and_fixed()
     _test_wraparound_seam_is_one_component()
