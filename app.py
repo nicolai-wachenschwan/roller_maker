@@ -456,6 +456,37 @@ with st.sidebar:
                  "Schalen-Aussenflaeche zurueckgesetzt sind.",
             key="ejector_flush_offset",
         )
+        ejector_wall_thickness = st.slider(
+            "Wandstaerke der Schale (mm)", 0.8, 6.0, 2.0, 0.1,
+            help="Radiale Wandstaerke des Schalen-Rohrs. Die Wand steht "
+                 "ueberall in voller Staerke, nur die Loecher gehen durch -- "
+                 "davon haengt die Haltbarkeit der Schale ab.",
+            key="ejector_wall_thickness",
+        )
+        ejector_bridge_width_mm = st.slider(
+            "Stegbreite fuer Verbindungen (mm)", 0.4, 3.0, 1.0, 0.1,
+            help="Breite der Stege, mit denen eingeschlossene Segmente "
+                 "(z.B. Puzzleteil-Innenflaechen) an den Rest der Schale "
+                 "angebunden werden. In Millimetern, damit die Stege bei "
+                 "jeder DPI-Einstellung druckbar bleiben.",
+            key="ejector_bridge_width_mm",
+        )
+        ejector_max_overhang = st.slider(
+            "Max. Überhangwinkel (Grad)", 30, 70, 45, 5,
+            help="Der Roller wird STEHEND gedruckt (Zylinderachse = "
+                 "Aufbaurichtung). Die Vorderkante der Kern-Stopfen wird auf "
+                 "diesen Winkel abgeschrägt, damit sie im geschlossenen Spalt "
+                 "ohne Stützmaterial druckt. Flacher = sicherer, aber die "
+                 "Stopfen erreichen erst später ihre volle Höhe.",
+            key="ejector_max_overhang",
+        )
+        ejector_min_feature_mm = st.slider(
+            "Kleinstes druckbares Detail (mm)", 0.0, 2.0, 0.8, 0.1,
+            help="Muster-Details unterhalb dieser Groesse werden entfernt "
+                 "(Materialfleckchen) bzw. gefuellt (Mini-Loecher), statt sie "
+                 "mit Stegen anzubinden. 0 = nichts entfernen.",
+            key="ejector_min_feature_mm",
+        )
         if not create_axis_hole:
             st.warning("⚠️ Der Auswerfer benoetigt eine Achsbohrung ('Create hole for axis').")
 
@@ -626,10 +657,13 @@ with col1:
                         cut_mask,
                         radius_mm=radius,
                         height_mm=cylinder_height_mm,
-                        wall_thickness_mm=displacement,
+                        wall_thickness_mm=ejector_wall_thickness,
                         radial_clearance_mm=ejector_clearance,
                         flush_offset_mm=ejector_flush_offset,
                         axis_diameter_mm=axis_diameter,
+                        bridge_width_mm=ejector_bridge_width_mm,
+                        min_feature_mm=ejector_min_feature_mm,
+                        max_overhang_deg=float(ejector_max_overhang),
                         cut_through=True,
                     )
                     st.session_state.shell_mesh = shell_mesh
@@ -644,17 +678,78 @@ with col1:
                             if ejector_report["severing_rings_found"]:
                                 st.warning(
                                     f"{len(ejector_report['severing_rings_found'])} Trennring(e) "
-                                    f"gefunden und mit Stegen repariert."
+                                    f"(voller Umlauf-Schnitt) gefunden und mit "
+                                    f"mehreren Stegen verstärkt."
                                 )
-                            if ejector_report["islands_found"]:
+                            components = ejector_report.get("components_found", 1)
+                            bridges = ejector_report.get("bridges_added", 0)
+                            if bridges:
                                 st.warning(
-                                    f"{ejector_report['islands_found']} freischwebende Insel(n) "
-                                    f"gefunden und automatisch angebunden."
+                                    f"{components} getrennte Musterteile gefunden "
+                                    f"(z.B. vollständig eingeschlossene Segmente) und "
+                                    f"mit {bridges} minimalen Stegen zu einem "
+                                    f"Körper verbunden."
                                 )
-                            if not ejector_report["severing_rings_found"] and not ejector_report["islands_found"]:
-                                st.info("Keine Trennringe oder Inseln im Muster gefunden.")
-                            st.metric("Überlappungsvolumen (Soll: 0)",
-                                      f"{ejector_report.get('overlap_volume_mm3', 0):.4f} mm³")
+                            elif not ejector_report["severing_rings_found"]:
+                                st.info(
+                                    "Muster war bereits zusammenhängend -- keine "
+                                    "Stege nötig."
+                                )
+                            if not ejector_report.get("single_body", True):
+                                st.error(
+                                    "Muster konnte nicht vollständig verbunden werden -- "
+                                    "es bleiben lose Teile übrig."
+                                )
+                            specks = (ejector_report.get("material_specks_removed", 0)
+                                      + ejector_report.get("hole_specks_filled", 0))
+                            if specks:
+                                st.info(
+                                    f"{ejector_report.get('material_specks_removed', 0)} zu kleine "
+                                    f"Materialfleckchen entfernt und "
+                                    f"{ejector_report.get('hole_specks_filled', 0)} Mini-Löcher "
+                                    f"gefüllt (nicht druckbare Details)."
+                                )
+                            ribs = ejector_report.get("support_ribs_added", 0)
+                            if ribs:
+                                st.info(
+                                    f"{ejector_report.get('floating_starts_found', 0)} Stelle(n) "
+                                    f"hätten beim Drucken in der Luft angefangen und wurden mit "
+                                    f"{ribs} senkrechten Stützrippe(n) abgefangen."
+                                )
+                            for warning in ejector_report.get("warnings", []):
+                                st.warning(warning)
+
+                            rep_col1, rep_col2, rep_col3 = st.columns(3)
+                            with rep_col1:
+                                st.metric("Überlappungsvolumen (Soll: 0)",
+                                          f"{ejector_report.get('overlap_volume_mm3', 0):.4f} mm³")
+                            with rep_col2:
+                                st.metric("Wandstärke Schale",
+                                          f"{ejector_report.get('shell_wall_thickness_mm', 0):.2f} mm")
+                            with rep_col3:
+                                st.metric("Kernwand (Achse → Mantel)",
+                                          f"{ejector_report.get('core_wall_thickness_mm', 0):.2f} mm")
+                            st.caption(
+                                "Druckrichtung: stehend, Zylinderachse = Aufbaurichtung. "
+                                f"Stopfen auf voller Höhe: "
+                                f"{ejector_report.get('plug_full_height_ratio', 0) * 100:.0f} % · "
+                                f"längste frei überbrückte Lochdecke: "
+                                f"{ejector_report.get('max_unsupported_span_mm', 0):.0f} mm"
+                            )
+                            st.caption(
+                                f"Stopfen-Abdeckung der Lochfläche: "
+                                f"{ejector_report.get('plug_coverage', 0) * 100:.0f} % · "
+                                f"Stegbreite: {ejector_report.get('bridge_width_px', ('?', '?'))} px "
+                                f"(θ, z)"
+                            )
+                            st.caption(
+                                f"Schale: {ejector_report.get('shell_bodies', '?')} Körper, "
+                                f"{ejector_report.get('shell_volume_mm3', float('nan')):.0f} mm³ · "
+                                f"Kern: {ejector_report.get('core_bodies', '?')} Körper, "
+                                f"{ejector_report.get('core_volume_mm3', float('nan')):.0f} mm³ "
+                                f"(Füllgrad {ejector_report.get('core_fill_ratio', float('nan')):.2f}, "
+                                f"1.0 = massiv)"
+                            )
                     else:
                         status_placeholder.error(
                             f"⚠️ Schale und Kern ueberlappen "

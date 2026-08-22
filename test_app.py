@@ -91,10 +91,39 @@ def _puzzle_pattern_bugreport_image_bytes(max_dim: int = 220) -> bytes:
     return buf.getvalue()
 
 
-def _run_with_uploaded_image(at: AppTest, image_bytes: bytes | None = None) -> AppTest:
-    at.file_uploader(key="uploaded_file").set_value(
-        ("test_pattern.png", image_bytes or _synthetic_test_image_bytes(), "image/png")
+def _make_uploaded_file(image_bytes: bytes):
+    """Baut ein Streamlit-UploadedFile-Objekt aus rohen PNG-Bytes."""
+    from streamlit.runtime.uploaded_file_manager import UploadedFile, UploadedFileRec
+
+    rec = UploadedFileRec(
+        file_id="test-image", name="test_pattern.png",
+        type="image/png", data=image_bytes,
     )
+    return UploadedFile(rec, None)
+
+
+def _run_with_uploaded_image(at: AppTest, image_bytes: bytes | None = None) -> AppTest:
+    data = image_bytes or _synthetic_test_image_bytes()
+    # AppTest.file_uploader gibt es erst ab Streamlit 1.50; requirements.txt
+    # pinnt <1.50 (pyvista-Kompatibilitaet). Fuer aeltere Versionen wird der
+    # Upload deshalb direkt ueber den Widget-Key im Session-State gesetzt --
+    # das ist derselbe Zustand, den das Widget nach einem echten Upload haette.
+    uploader = getattr(at, "file_uploader", None)
+    if uploader is not None:
+        uploader(key="uploaded_file").set_value(
+            ("test_pattern.png", data, "image/png")
+        )
+    else:
+        # Der Widget-Wert wird bei jedem Rerun aus dem Widget-Baum neu
+        # gesetzt (und waere dann wieder None), deshalb wird der Upload vor
+        # jedem Lauf erneut injiziert.
+        original_run = at.run
+
+        def run_with_upload(*args, **kwargs):
+            at.session_state["uploaded_file"] = _make_uploaded_file(data)
+            return original_run(*args, **kwargs)
+
+        at.run = run_with_upload
     at.run(timeout=APP_TIMEOUT)
     return at
 
@@ -276,6 +305,95 @@ def test_ejector_system_with_original_bugreport_image():
         f"Schale und Kern ueberlappen beim Original-Bugreport-Bild: "
         f"{report['overlap_volume_mm3']} mm3"
     )
+
+
+def _puzzle_grid_image_bytes(ny: int = 240, nx: int = 180) -> bytes:
+    """Ein Puzzle-artiges Raster: die Schnittlinien bilden geschlossene
+    Zellen, jedes Segment ist damit VOLLSTAENDIG EINGESCHLOSSEN. Ohne
+    Verbindungsstege wuerde daraus eine Schale aus lauter losen Teilen."""
+    img = Image.new("L", (nx, ny), color=255)
+    draw = ImageDraw.Draw(img)
+    for y in range(0, ny, 40):
+        draw.rectangle([10, y, nx - 10, y + 3], fill=0)
+    for x in range(10, nx - 9, 35):
+        draw.rectangle([x, 0, x + 3, ny], fill=0)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_ejector_system_connects_enclosed_puzzle_segments():
+    """Grenzfall aus dem Bugreport: bei einem Puzzle-artigen Muster sind die
+    Segmente vollstaendig eingeschlossen. Ueber die App-UI muss trotzdem eine
+    Schale herauskommen, die aus GENAU EINEM Koerper besteht (keine losen
+    Inseln), und die Verbindung muss mit minimal vielen Stegen passieren."""
+    at = AppTest.from_file("app.py")
+    at.run(timeout=APP_TIMEOUT)
+    at = _run_with_uploaded_image(at, _puzzle_grid_image_bytes())
+    assert not at.exception
+
+    at.checkbox(key="create_axis_hole").set_value(True)
+    at.checkbox(key="generate_ejector_system").set_value(True)
+    at.run(timeout=APP_TIMEOUT)
+
+    at.button(key="generate_button").click()
+    at.run(timeout=APP_TIMEOUT)
+
+    assert not at.exception, f"Unerwartete Exception: {at.exception}"
+    report = at.session_state["ejector_report"]
+    assert report is not None
+    assert report["components_found"] > 1, (
+        "Testmuster sollte eingeschlossene Segmente enthalten"
+    )
+    assert report["single_body"], "Muster wurde nicht zu einem Koerper verbunden"
+    assert report["bridges_added"] <= report["components_found"] - 1
+    assert report["shell_bodies"] == 1, (
+        f"Schale zerfaellt in {report['shell_bodies']} lose Teile"
+    )
+    assert report["core_bodies"] == 1
+    assert report["overlap_free"] is True, report["overlap_volume_mm3"]
+
+
+def test_ejector_parts_are_durable_not_hollow():
+    """Zweiter gemeldeter Fehler: 'beide Zylinder hohl -> geringe
+    Haltbarkeit'. Ueber die App-UI nachgerechnet: die Schale muss die
+    eingestellte Wandstaerke wirklich haben (Volumen ~ Kreisring abzueglich
+    Loecher) und der Kern muss massiv sein."""
+    at = AppTest.from_file("app.py")
+    at.run(timeout=APP_TIMEOUT)
+    at = _run_with_uploaded_image(at)
+    assert not at.exception
+
+    at.checkbox(key="create_axis_hole").set_value(True)
+    at.checkbox(key="generate_ejector_system").set_value(True)
+    at.run(timeout=APP_TIMEOUT)
+    at.slider(key="ejector_wall_thickness").set_value(2.0)
+    at.run(timeout=APP_TIMEOUT)
+
+    at.button(key="generate_button").click()
+    at.run(timeout=APP_TIMEOUT)
+
+    assert not at.exception, f"Unerwartete Exception: {at.exception}"
+    report = at.session_state["ejector_report"]
+    shell_mesh = at.session_state["shell_mesh"]
+    core_mesh = at.session_state["core_mesh"]
+
+    assert report["shell_wall_thickness_mm"] == pytest.approx(2.0)
+    radii = report["radii_mm"]
+    height = shell_mesh.bounds[1, 2] - shell_mesh.bounds[0, 2]
+    nominal_ring = np.pi * (radii["shell_outer"] ** 2 - radii["shell_inner"] ** 2) * height
+    # Selbst wenn die Haelfte des Musters Loch ist, darf die Wand nicht auf
+    # eine duenne Haut zusammenschrumpfen.
+    assert shell_mesh.volume > 0.3 * nominal_ring, (
+        f"Schale hat nur {shell_mesh.volume:.0f} mm3 von maximal "
+        f"{nominal_ring:.0f} mm3 -- die Wand ist zu einer Haut geschrumpft"
+    )
+    assert report["core_fill_ratio"] > 0.95, (
+        f"Kern ist hohl (Fuellgrad {report['core_fill_ratio']:.2f})"
+    )
+    assert core_mesh.volume > 0.95 * np.pi * (
+        radii["core_outer"] ** 2 - radii["axis"] ** 2
+    ) * height
 
 
 if __name__ == "__main__":
