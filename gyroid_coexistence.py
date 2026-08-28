@@ -394,6 +394,31 @@ def dilate_3d(mask: np.ndarray, mm: float, grid: CylGrid) -> np.ndarray:
     return out
 
 
+def _distance_outside(mask: np.ndarray, grid: CylGrid,
+                      reach_mm: float) -> np.ndarray:
+    """Abstand in Millimetern zur Menge ``mask``, bei ``reach_mm`` gekappt.
+
+    Dient als weiche Verlegung der Trennflaeche: ``min(phi, d - eps)`` macht
+    die Menge selbst und ihre unmittelbare Umgebung zur Ausstoesserseite und
+    laesst die Grenze darum herum auf ``reach_mm`` auslaufen, statt ein Loch
+    mit senkrechten Waenden zu stanzen.
+
+    Die Winkelrichtung ist periodisch; deshalb wird das Feld vor der
+    Abstandstransformation um so viele Spalten umlaufend erweitert, wie die
+    Reichweite ueberhaupt tragen kann. Als Winkelmass dient die Bogenlaenge
+    auf halbem Radius -- ein Mittelwert, der fuer ein Steuerfeld genuegt,
+    waehrend jeder harte Abstand (Spalt, Wandstaerke) weiterhin ueber
+    ``dilate_xy`` mit der exakten Sehnenmetrik laeuft.
+    """
+    pitch = grid.dtheta * max(grid.r_centers().mean(), 1e-6)
+    pad = int(np.ceil(reach_mm / max(pitch, 1e-9))) + 1
+    pad = min(pad, mask.shape[0])
+    wide = np.concatenate((mask[-pad:], mask, mask[:pad]), axis=0)
+    d = ndimage.distance_transform_edt(
+        ~wide, sampling=(pitch, grid.dz, grid.dr))
+    return np.minimum(d[pad:pad + mask.shape[0]], reach_mm).astype(np.float32)
+
+
 def _disk_offsets(radius_px: int) -> np.ndarray:
     r = int(radius_px)
     yy, xx = np.mgrid[-r:r + 1, -r:r + 1]
@@ -712,6 +737,17 @@ def fit_gyroid(grid: CylGrid, zone: np.ndarray, clearance_mm: float,
                 usable_here = usable_here or usable
                 # Brauchbar schlaegt unbrauchbar; darunter zaehlt die feinste
                 # Masche, dann wenig schwebendes Material, dann Wandstaerke.
+                #
+                # Auch dann, wenn KEINE Masche brauchbar ist -- bei dichten
+                # Mustern der Normalfall. Nach Tragfaehigkeit statt Feinheit
+                # zu sortieren liegt nahe (die groebste Masche hat die
+                # dicksten Waende), macht das Ergebnis aber schlechter: bei
+                # 13.2 mm statt 5.5 mm stehen zwar beide Haelften mit 63 %
+                # Wandstaerke da, aber das Volumen verteilt sich 40406 zu
+                # 7365 mm3 zugunsten der Klinge -- ein Ausstoesser, der
+                # nichts mehr herausdrueckt. Die feine Masche teilt
+                # gleichmaessiger, und was sie an Zusammenhang schuldig
+                # bleibt, holen die Reparaturen nach.
                 key = (not usable, period, floating, -min(wa, wb))
                 if best_key is None or key < best_key:
                     best_key, best = key, cand
@@ -1177,7 +1213,8 @@ def resolve_diagonal_contacts(occ: np.ndarray, allowed: np.ndarray,
                               max_overhang_deg: float = 45.0,
                               max_passes: int = 4,
                               require_support: bool = True,
-                              separate_only: bool = False
+                              separate_only: bool = False,
+                              fill_only: bool = False
                               ) -> tuple[np.ndarray, dict]:
     """Kantenkontakte aufloesen -- durch Fuellen, sonst durch Trennen.
 
@@ -1201,6 +1238,15 @@ def resolve_diagonal_contacts(occ: np.ndarray, allowed: np.ndarray,
     Geht das nicht, wird GETRENNT: einer der beiden Partner faellt weg,
     bevorzugt der, der kein Muster traegt. Ein verlorenes Voxel ist
     verschmerzbar, eine Sollbruchstelle nicht.
+
+    Mit ``fill_only`` unterbleibt das Trennen. Das ist kein Nachlassen,
+    sondern eine Frage des Verhaeltnisses: bei einem dichten Muster sind es
+    nicht eine Handvoll Kontakte, sondern Zehntausende (am Puzzle-Bild 24167
+    gefuellte und 1537 getrennte), und jedes Trennen kann die Klinge
+    zerschneiden -- sie zerfiel dadurch in 53 Teile. Was ungetrennt
+    stehenbleibt, loest das Vernetzen auf, indem es die geteilte Ecke
+    aufspaltet; ein zerlegter Koerper dagegen ist durch nichts mehr zu
+    retten.
     """
     occ = occ.copy()
     filled = removed = 0
@@ -1344,18 +1390,19 @@ def drop_unreachable(occ: np.ndarray, protect: np.ndarray, grid: CylGrid,
     stillschweigend mitexportiert werden -- es wuerde im fertigen Teil lose
     herumklappern.
 
-    Entfernt wird JEDES Fragment ausser dem groessten -- auch eines, das
-    Muster traegt. Ein nicht angebundenes Musterdetail ist naemlich kein
-    halbes Produkt, sondern ein loses Teil im Bauraum: eine Ausstoesserplatte
-    ohne Verbindung zum Ausstoesser drueckt nichts heraus, und ein
-    abgetrenntes Stueck Klinge faellt beim ersten Gebrauch heraus. Beides
-    exportiert man nicht.
+    Zwei Regeln, und die Unterscheidung dazwischen ist die ganze Arbeit:
 
-    Gezaehlt und gemeldet wird es aber, getrennt nach "trug Muster" und "trug
-    keines", mit Volumen. Ob der Verlust hinnehmbar ist, entscheidet der
-    Report weiter oben anhand von ``droppable_fragment_mm3``: kleine Reste
-    sind eine Randnotiz, ein grosser ist ein Grund, die Parameter zu aendern
-    (kleinerer Hub, groesserer Radius, feineres Gitter).
+    - Fragmente OHNE geschuetztes Material sind Fuellung. Sie werden entfernt;
+      sie tragen nichts bei und wuerden nur klappern.
+    - Fragmente MIT geschuetztem Material bleiben stehen und werden gemeldet.
+      Geschuetzt ist das Produkt: die Klingenlinien und die
+      Ausstoesserplatten. Sie zu loeschen, nur weil sie gerade nicht am
+      groessten Klumpen haengen, macht aus einem unvollstaendigen Bauteil ein
+      unbrauchbares -- gemessen verschwand so das GESAMTE Plattenband des
+      Ausstoessers, waehrend die Nabe als "groesste Komponente" stehen blieb.
+
+    Aus demselben Grund ist der Hauptkoerper nicht einfach der groesste,
+    sondern der mit dem meisten geschuetzten Material.
     """
     labels, n = label_periodic(occ)
     info = {"loose_removed": 0, "loose_with_pattern": 0,
@@ -1365,25 +1412,29 @@ def drop_unreachable(occ: np.ndarray, protect: np.ndarray, grid: CylGrid,
         return occ, info
     sizes = np.bincount(labels.ravel(), minlength=n + 1)
     sizes[0] = 0
-    main = int(np.argmax(sizes))
+    protected_counts = np.bincount(labels[protect & occ].ravel(),
+                                   minlength=n + 1)
+    protected_counts[0] = 0
+    main = int(np.argmax(protected_counts if protected_counts.any() else sizes))
+
     vol_per_ring = grid.voxel_volume()
     volumes = np.zeros(n + 1)
     for i in range(grid.nr):
-        volumes += np.bincount(labels[:, :, i].ravel(), minlength=n + 1) * vol_per_ring[i]
-    protected = set(int(x) for x in np.unique(labels[protect & occ]) if x > 0)
+        volumes += np.bincount(labels[:, :, i].ravel(),
+                               minlength=n + 1) * vol_per_ring[i]
 
     keep = np.zeros(n + 1, dtype=bool)
     keep[main] = True
     for i in range(1, n + 1):
         if i == main or sizes[i] == 0:
             continue
-        if i in protected:
-            info["pattern_fragments_dropped"] += 1
-            info["pattern_volume_dropped_mm3"] += float(volumes[i])
+        if protected_counts[i]:
+            keep[i] = True
+            info["loose_with_pattern"] += 1
+            info["pattern_volume_dropped_mm3"] += 0.0
         else:
             info["loose_removed"] += 1
-            info["loose_volume_dropped_mm3"] = (
-                info.get("loose_volume_dropped_mm3", 0.0) + float(volumes[i]))
+            info["loose_volume_dropped_mm3"] += float(volumes[i])
     return occ & keep[labels], info
 
 
@@ -1797,25 +1848,24 @@ def allegiance_field(blade2d: np.ndarray, grid: CylGrid, fit: GyroidFit,
     return np.minimum(phi, hub_field[None, None, :])
 
 
-def enforce_blade_continuity(side: np.ndarray, blade2d: np.ndarray,
-                             grid: CylGrid, deep_start_mm: float,
-                             min_radius_mm: float
-                             ) -> tuple[np.ndarray, dict]:
-    """Jede Klingenlinie bekommt eine durchgehende Verbindung von der
-    Mantelflaeche bis zu ihrem eigenen Gyroid-Netzwerk.
+def continuity_columns(claim2d: np.ndarray, own_material: np.ndarray,
+                       grid: CylGrid, deep_start_mm: float,
+                       min_radius_mm: float) -> np.ndarray:
+    """Fuellt fuer jedes Pixel eines Koerpers den 45deg-Strahl von der
+    Mantelflaeche nach innen -- bis zu dem Punkt, an dem der Strahl das
+    eigene Material in der Tiefe zum ersten Mal trifft.
 
-    Ohne das ist die Vollstaendigkeit des Musters nicht zu halten: die
+    Ohne diese Saeulen ist keiner der beiden Koerper zu halten. Die
     Ueberblendung entscheidet tief unten allein nach dem Gyroid, und wo
-    dieses unter einer Klingenlinie "Ausstoesser" sagt, reisst die
-    45deg-Treppe ab. Alles darueber steht dann in der Luft, die
-    Stuetzreparatur trimmt es weg -- und mit ihm das Muster. Gemessen am
-    Puzzlebild fehlten so 41.6 % der Klingenpixel im fertigen Koerper, bei
-    11156 weggetrimmten Voxeln.
+    dieses unter einem Musterdetail die andere Seite waehlt, reisst die
+    45deg-Treppe ab: alles darueber steht in der Luft und wird von der
+    Stuetzreparatur weggetrimmt. An der Klinge waren das 41.6 % der
+    Musterpixel, am Ausstoesser die kompletten Platten der unteren 40 % der
+    Bauhoehe.
 
-    Gefuellt wird entlang des 45deg-Strahls, und nur so weit, wie noetig: bis
-    zum ersten Punkt, an dem der Strahl ohnehin schon zur Klinge gehoert und
-    tief genug fuer das Gyroid ist. Ab dort traegt das Netzwerk. Was sein
-    Netzwerk gar nicht trifft, laeuft bis an die Nabe durch.
+    Gefuellt wird nur so weit wie noetig -- ab dem Treffer traegt das
+    Netzwerk. Was sein Netzwerk nie trifft, laeuft bis ``min_radius_mm``
+    durch.
     """
     nt, nz, nr = grid.shape
     depth_of_k = grid.depth_centers()[::-1]
@@ -1823,119 +1873,409 @@ def enforce_blade_continuity(side: np.ndarray, blade2d: np.ndarray,
     k_idx = np.arange(nr)
 
     deep = depth_of_k >= deep_start_mm
-    anchored = to_ray(side, grid) & deep[None, None, :]
+    anchored = to_ray(own_material, grid) & deep[None, None, :]
     has = anchored.any(axis=2)
     first = np.argmax(anchored, axis=2)
     last = np.where(has, first, nr - 1)
-
     reach = (k_idx[None, None, :] <= last[:, :, None])
     reach &= (r_of_k >= min_radius_mm - 1e-9)[None, None, :]
-    filled = from_ray(blade2d[:, :, None] & reach, grid)
-    added = int((filled & ~side).sum())
-    return side | filled, {"added": added, "columns": filled}
+    return from_ray(claim2d[:, :, None] & reach, grid)
+
+
+def pillars_to_the_plate(columns: np.ndarray, body: np.ndarray, grid: CylGrid,
+                         max_overhang_deg: float) -> np.ndarray:
+    """Wo eine Saeule ihr Netzwerk nicht mehr trifft, endet sie am
+    Nabenabstand -- und ihre Spitze steht dort auf nichts. Radial kann sie
+    nicht weiter (dahinter liegt der Bewegungsraum der Nabe), senkrecht aber
+    schon: eine Stuetze bis zur Druckplatte. Das ist mit 0 Grad Ueberhang
+    druckbar, verankert das Detail zusaetzlich am Boden und kostet ein paar
+    Voxel."""
+    tips = columns & body & ~support_map(body, grid, max_overhang_deg)
+    if not tips.any():
+        return np.zeros_like(body)
+    return np.flip(np.maximum.accumulate(np.flip(tips, axis=1), axis=1), axis=1)
 
 
 def split_bodies(blade2d: np.ndarray, grid: CylGrid, fit: GyroidFit,
                  cfg: CoexistenceConfig) -> tuple[np.ndarray, np.ndarray, dict]:
     """Aus der Trennflaeche werden zwei Koerper mit garantiertem Spalt.
 
-    Zwei Dinge sind hier verschieden wichtig. Das MUSTER ist das Produkt: es
-    muss vollstaendig im Bauteil landen, also wird an der Klinge im
-    Aussenband und an ihren Verbindungssaeulen nach innen nichts
-    weggenommen. Was tief innen vom Gyroid uebrigbleibt, ist dagegen blosse
-    Struktur -- dort duerfen sich beide Koerper den Spalt teilen. Genau diese
-    Unterscheidung macht ein feines Gyroid moeglich: traegt der Ausstoesser
-    den Spalt ueberall allein, muss die Masche so gross werden, dass seine
-    Kanaele die Erosion ueberstehen (gemessen 25 mm Periode und nur 41 % des
-    Materials dicker als die Mindestwandstaerke).
+    In dieser Reihenfolge, und die Reihenfolge ist die eigentliche Aussage:
 
-    Der Ausstoesser ist danach nicht die Gegenseite der Trennflaeche, sondern
-    schlicht ALLES, was weit genug von der fertigen Klinge entfernt ist. Damit
-    faellt ihm jeder Millimeter zu, den die Klinge tief innen abgibt, und der
-    Spalt ist trotzdem exakt: er ist als Abstand zum fertigen Koerper
-    definiert, nicht als Nebenprodukt zweier Erosionen.
+    1. ZUERST DIE SCHNEIDE. Sie ist das Produkt: ihr Muster geht
+       unveraendert ins Bauteil, und jede Linie bekommt eine durchgehende
+       Saeule bis zu ihrem eigenen Netzwerk.
+    2. DANN DER AUSSTOESSER. Seine Platten brauchen dasselbe: eine
+       durchgehende Verbindung nach innen. Ohne sie reisst ihre 45deg-Treppe
+       dort ab, wo das Gyroid unter der Platte die andere Seite waehlt --
+       gemessen fehlten dadurch die Platten der unteren 40 % der Bauhoehe,
+       und ein Ausstoesser, der nur oben Platten hat, drueckt nichts heraus.
+    3. DANN DIE KONFLIKTE. Wo die Verbindung des Ausstoessers durch
+       Klingenmaterial laufen muesste, wird dieses Material FREIGEGEBEN --
+       aber nur, wo es blosse Gyroid-Fuellung ist. Muster und Klingensaeulen
+       bleiben unangetastet.
 
-    Gefordert ist die halbe Hubstrecke: der Ausstoesser sitzt exzentrisch und
-    wandert aus seiner Mittellage um +-travel/2.
+    Punkt 3 ist die "clevere Aufteilung": das Gyroid ist tief innen nur
+    Struktur, und Struktur ist ersetzbar -- eine Verbindung an der Unterkante
+    einer Ausstoesserplatte ist dringender als ein weiteres Stueck Fuellung
+    an der Klinge, die dort ohnehin schon durchgehend angebunden ist. Der
+    Zusammenhang der Klinge leidet nicht: ihr Netzwerk ist dreidimensional
+    und findet einen Weg daneben; was doch abreisst, naeht die
+    Verbindungsreparatur wieder zusammen.
+
+    Der Spalt bleibt dabei exakt. Er ist als Abstand zum FERTIGEN
+    Klingenkoerper definiert (``ejector = ~dilate_xy(blade, ...)``), also
+    entsteht er neu, nachdem alle Umverteilungen stattgefunden haben.
     """
     phi = allegiance_field(blade2d, grid, fit, cfg)
     depth = grid.depth_centers()
     clearance = cfg.clearance_mm()
     deep_start = cfg.cut_depth_mm + cfg.blend_mm
+    blade_min_r = cfg.hub_radius() + clearance + cfg.print_clearance_mm
+    info: dict = {}
+
+    outer = np.zeros(grid.shape, dtype=bool)
+    outer[:, :, depth < cfg.cut_depth_mm] = True
+    side_raw = phi >= 0
+
+    # -- 1. Der Anspruch der Schneide -------------------------------------
+    # Zuerst wird festgehalten, was der Klinge unter keinen Umstaenden
+    # genommen werden darf: ihr Muster im Aussenband und die 45deg-Saeule,
+    # mit der jede Musterlinie ihr Netzwerk in der Tiefe erreicht.
+    #
+    # Nur die UNTERKANTE des Musters braucht eine Saeule. Eine Klingenlinie
+    # ist wie eine Platte ein zusammenhaengendes Gebilde: ihre Zellen stehen
+    # aufeinander, nur ihre unterste Bildzeile hat nichts unter sich. Saeulen
+    # von JEDEM Musterpixel aus sind nicht nur ueberfluessig, sie sind
+    # schaedlich -- sie machten mehr als die Haelfte des Klingenmaterials
+    # aus, und jede von ihnen traegt einen Sperrguertel von der Breite des
+    # Bewegungsspalts.
+    deep = depth >= deep_start
+    blade_network = side_raw & deep[None, None, :]
+    blade_edge2d = blade2d.copy()
+    blade_edge2d[:, 1:] &= ~blade2d[:, :-1]
+    blade_claim = continuity_columns(blade_edge2d, blade_network, grid,
+                                     deep_start, blade_min_r)
+    blade_need = blade_claim | (side_raw & outer)
+
+    # -- 2. Der Anspruch des Ausstoessers ---------------------------------
+    # Seine Musterflaeche ist alles, was in der Bildebene weit genug von der
+    # Klinge entfernt ist -- die Platte, die spaeter das Teil herausdrueckt.
+    # Auch sie braucht eine durchgehende Verbindung nach innen, und zwar
+    # ebenfalls nur von ihrer Unterkante aus: gibt man JEDEM Plattenpixel
+    # eine Saeule, sind das bei 78 % Plattenanteil eine halbe Million Voxel.
+    #
+    # Ohne diese Saeulen reisst die 45deg-Treppe der Platte dort ab, wo das
+    # Gyroid unter ihr die andere Seite waehlt -- gemessen fehlten dadurch
+    # die Platten der unteren 40 % der Bauhoehe, und ein Ausstoesser, der
+    # nur oben Platten hat, drueckt nichts heraus.
+    pitch = grid.dtheta * grid.radius_mm
+    plate2d = signed_pattern_distance(blade2d, pitch, grid.dz) <= -(
+        clearance + grid.voxel_mm)
+    lower_edge2d = plate2d.copy()
+    lower_edge2d[:, 1:] &= ~plate2d[:, :-1]
+    ejector_network = ~side_raw & deep[None, None, :]
+    plate_columns = continuity_columns(lower_edge2d, ejector_network, grid,
+                                       deep_start, 0.0)
+    plate_columns[:, :, depth < cfg.cut_depth_mm] = False
+    info["plate_area_fraction"] = float(plate2d.mean())
+    info["plate_lower_edge_pixels"] = int(lower_edge2d.sum())
+
+    # -- 3. Die Konflikte -- geloest IN DER TRENNFLAECHE -------------------
+    # Wo beide Anspruch auf dieselbe Zelle erheben, gewinnt der Ausstoesser,
+    # solange es sich um blosse Gyroid-Fuellung handelt: eine Verbindung an
+    # der Unterkante einer Platte wird dringender gebraucht als ein weiteres
+    # Stueck Stuetzung der Klinge, die dort ohnehin schon durchgehend
+    # angebunden ist. Muster und Klingensaeulen sind tabu.
+    #
+    # Entscheidend ist das WANN. Zieht man die Korridore erst aus dem
+    # fertigen Klingenkoerper heraus, bleiben ihre Saeulen als Inseln
+    # mitten im Loch stehen: gemessen 34182 herausgeschnittene Voxel, 2911
+    # Fragmente und am Ende 117 Klingenteile. Verschiebt man stattdessen
+    # die Trennflaeche, bevor ueberhaupt Klingenmaterial entsteht, bleibt
+    # das Gyroid EINE Flaeche -- die Fuellung der Klinge laeuft daneben
+    # weiter, statt zerrissen zu werden. Das ist die "clevere Aufteilung
+    # des Gyroids": nicht schneiden, sondern die Grenze verlegen.
+    demand = plate_columns & ~blade_need
+    info["conflict_voxels"] = int((plate_columns & side_raw).sum())
+    info["blade_yielded_voxels"] = int((demand & side_raw).sum())
+    if demand.any():
+        # Die Grenze wird weich verlegt, nicht gestanzt: ein Loch mit
+        # senkrechten Waenden erzeugt genau die duennen Grate, die der
+        # Freischnitt anschliessend zu Splittern zerlegt. Der Abstand zur
+        # Nachfrage laesst die Flaeche stattdessen auf ein paar Millimetern
+        # auslaufen.
+        reach = clearance + 2.0 * cfg.min_wall_mm
+        bias = _distance_outside(demand, grid, reach)
+        phi = np.minimum(phi, bias - grid.voxel_mm)
+        # Was die Klinge wirklich braucht, holt sie sich zurueck. Ihr
+        # Anspruch ist per Bau zusammenhaengend -- er haengt am Muster im
+        # Aussenband --, es entstehen also keine Inseln.
+        phi[blade_need] = np.maximum(phi[blade_need], np.float32(grid.voxel_mm))
 
     side = phi >= 0
 
-    # Das Aussenband ist immer unantastbar -- dort steht das Muster.
-    outer = np.zeros(grid.shape, dtype=bool)
-    outer[:, :, depth < cfg.cut_depth_mm] = True
-
+    # -- Erst jetzt die Koerper -------------------------------------------
     # ZUERST schneiden, DANN die Verbindung suchen. Andersherum enden die
-    # Saeulen auf Material, das die Erosion gleich darauf wieder wegnimmt --
-    # sie haengen dann in der Luft und werden als lose Fragmente entsorgt
-    # (gemessen 468 Stueck mit 395 mm3, und 135 schwebende Voxel).
+    # Saeulen auf Material, das die Erosion gleich darauf wieder wegnimmt.
     #
-    # Der Schnittbetrag ist nicht die halbe Spaltbreite, sondern die halbe
-    # Spaltbreite PLUS eine halbe Zelle: der Ausstoesser wird mit der
-    # konservativen Flaeche-zu-Flaeche-Metrik freigeschnitten und zahlt
-    # dadurch einen Zuschlag von rund einer Voxelkante, den die Klinge mit
-    # ihrer Mittelpunkt-Erosion nicht zahlt. Traegt er ihn allein, bleibt bei
-    # feiner Masche nichts von ihm uebrig (gemessen 2.8 % Volumen gegenueber
-    # 21 % fuer die Klinge bei 7.8 mm Periode). Mit dem Ausgleich sind beide
-    # Haelften etwa gleich dick, und die Masche darf halb so gross werden.
+    # Der Schnittbetrag ist die halbe Spaltbreite PLUS eine halbe Zelle: der
+    # Ausstoesser wird mit der konservativen Flaeche-zu-Flaeche-Metrik
+    # freigeschnitten und zahlt dadurch einen Zuschlag von rund einer
+    # Voxelkante, den die Klinge mit ihrer Mittelpunkt-Erosion nicht zahlt.
+    # Traegt er ihn allein, bleibt bei feiner Masche nichts von ihm uebrig.
     shave_mm = clearance / 2.0 + grid.voxel_mm / 2.0
     shave = side & ~outer & dilate_xy(~side, shave_mm, grid, solid=False)
     blade = side & ~shave
 
-    blade, continuity = enforce_blade_continuity(
-        blade, blade2d, grid, deep_start,
-        cfg.hub_radius() + clearance + cfg.print_clearance_mm)
-
-    # Wo eine Saeule ihr Netzwerk nicht mehr trifft, endet sie am
-    # Nabenabstand -- und ihre Spitze steht dort auf nichts. Radial kann sie
-    # nicht weiter (dahinter liegt der Bewegungsraum der Nabe), senkrecht
-    # aber schon: eine Stuetze bis zur Druckplatte. Das ist druckbar (0 Grad
-    # Ueberhang), verankert das Musterdetail zusaetzlich am Boden und kostet
-    # ein paar Voxel. Ohne sie bleiben genau diese Spitzen schwebend
-    # (gemessen 81 von 87 Faellen bei Tiefe 22 mm = Nabenabstand).
-    tips = (continuity["columns"] & blade
-            & ~support_map(blade, grid, cfg.max_overhang_deg))
-    pillars = np.flip(np.maximum.accumulate(np.flip(tips, axis=1), axis=1),
-                      axis=1)
-    blade |= pillars
-
+    blade_columns = continuity_columns(blade_edge2d, blade, grid, deep_start,
+                                       blade_min_r)
+    blade |= blade_columns
+    blade_pillars = pillars_to_the_plate(blade_columns, blade, grid,
+                                         cfg.max_overhang_deg)
+    blade |= blade_pillars
+    blade_structure = blade_columns | blade_pillars
     # Unantastbar sind die MUSTERZELLEN im Aussenband -- nicht das ganze
-    # Band. Der Unterschied ist entscheidend: schuetzt man den Bereich statt
-    # des Materials, dann geniesst auch jede Zelle Schutz, die eine Reparatur
-    # spaeter dort hineinsetzt, und ein schwebender Verbindungssteg im Band
-    # laesst sich nie wieder entfernen (gemessen 95 solcher Voxel, alle in
-    # Tiefe 3 mm, keines davon Muster).
-    protect = blade & outer
+    # Band. Schuetzt man den Bereich statt des Materials, geniesst auch jede
+    # Zelle Schutz, die eine Reparatur spaeter dort hineinsetzt.
+    blade_protect = blade & outer
 
-    # Der Ausstoesser haelt eine halbe Voxelkante MEHR Abstand als noetig. Ohne
-    # diese Reserve hat die Klinge nirgends Platz: der Spalt ist dann exakt
-    # so breit wie gefordert, jede Zelle neben der Klinge liegt naeher als
-    # der Spalt am Ausstoesser -- und damit kann die Stuetzreparatur kein
-    # einziges Voxel setzen und der Kantenschluss keine einzige Luecke
-    # fuellen. Uebrig bleiben schwebende Musterzellen und ein Mesh, das nicht
-    # schliesst. Eine Zelle Reserve kostet den Ausstoesser wenig und gibt
-    # jeder Nachbesserung an der Klinge den noetigen Spielraum.
-    ejector = (~dilate_xy(blade, clearance + grid.voxel_mm / 2.0, grid)
-               & ~dilate_3d(blade, cfg.print_clearance_mm, grid))
-    # Die Tasche vor dem Ausstoesser ist so tief wie die Schneide: dort sitzt
-    # das geschnittene Teil, und aus ihr drueckt die Platte es heraus.
-    ejector[:, :, depth < cfg.cut_depth_mm] = False
+    # Die Platte selbst, in die Tiefe gezogen: das ist das Produkt des
+    # Ausstoessers, so wie die Klingenlinie das der Schneide ist.
+    plate_slab = np.zeros(grid.shape, dtype=bool)
+    slab_zone = (depth >= cfg.cut_depth_mm) & (depth < deep_start)
+    plate_slab[:, :, slab_zone] = shear_field(
+        plate2d.astype(np.float32), grid)[:, :, slab_zone] > 0.5
 
-    return blade, ejector, {
-        "continuity_voxels_added": continuity["added"],
+    # -- 4. Die echten Konflikte suchen und loesen ------------------------
+    # Bis hierher waren die Saeulen eine VERMUTUNG darueber, wo Verbindungen
+    # gebraucht werden. Jetzt wird nachgeschaut: welche Teile des
+    # Ausstoessers haengen tatsaechlich noch in der Luft?
+    #
+    # Fuer die bekommt er einen Weg durch das Klingenmaterial -- aber nur
+    # durch dessen FUELLUNG. Muster und Klingensaeulen sind tabu. Genau das
+    # ist die Rangfolge: eine Ausstoesserplatte, die sonst gar nicht
+    # angebunden waere, wiegt schwerer als ein weiteres Stueck Gyroid an der
+    # Klinge, die dort ohnehin schon durchgehend haengt.
+    margin = grid.voxel_mm / 2.0
+
+    def complement_of(body: np.ndarray) -> np.ndarray:
+        out = (~dilate_xy(body, clearance + margin, grid)
+               & ~dilate_3d(body, cfg.print_clearance_mm, grid))
+        out[:, :, depth < cfg.cut_depth_mm] = False
+        return out
+
+    def room_beside(reserved: np.ndarray) -> np.ndarray:
+        out = (~dilate_xy(reserved, clearance + margin, grid)
+               & ~dilate_3d(reserved, cfg.print_clearance_mm, grid))
+        out[:, :, depth < cfg.cut_depth_mm] = False
+        return out
+
+    # Kurzes Suchbudget: ein Konflikt ist LOKAL. Der Ausstoesser muss eine
+    # Klingensaeule kreuzen -- ein bis zwei Voxel breit, plus Spalt. Wer hier
+    # mit dem vollen Budget sucht, laesst die Breitensuche das halbe Bauteil
+    # abklappern, ohne mehr zu finden.
+    local_steps = max(8, int(round(3 * (clearance + 2 * cfg.min_wall_mm)
+                                   / grid.voxel_mm)))
+
+    ejector = complement_of(blade)
+    ejector_paths = np.zeros_like(ejector)
+    forced_paths = np.zeros_like(ejector)
+    resolved = 0
+    # ERST der schonende Weg: einer, der die Klingensaeulen NICHT kreuzt.
+    # Nur was so nicht anzubinden ist, darf hindurch. Das ist der
+    # Unterschied zwischen "der Ausstoesser hat Vorrang" und "der
+    # Ausstoesser darf alles": mit der groben Fassung zerfiel die Klinge in
+    # 56 Teile, obwohl die allermeisten Konflikte auch daneben zu loesen
+    # waren.
+    for tier, reserved in enumerate((blade_protect | blade_structure,
+                                     blade_protect)):
+        # Die erste Stufe darf weit suchen: sie laesst die Tragstruktur der
+        # Klinge unangetastet und kostet sie nur Fuellung, die sich daneben
+        # wieder schliesst. Mit dem kurzen Budget blieb der Ausstoesser in
+        # fuenf grossen Bloecken liegen (10976, 9936, 8967, 8480, 3453 mm3),
+        # weil die kuerzeste Verbindung zwischen ihnen laenger ist als ein
+        # lokaler Konflikt breit. Die zweite Stufe -- die, die eine
+        # Klingensaeule kappen darf -- bleibt kurz: was so weit weg ist,
+        # dass es sie kreuzen muesste, ist den Schnitt nicht wert.
+        steps = cfg.max_link_steps if tier == 0 else local_steps
+        current = ejector | ejector_paths
+        # Splitter treiben keine Verbindungen. Sie sind Ausschuss der
+        # Erosion, und ein Steg zu ihnen kostet die Klinge Material fuer
+        # nichts.
+        current, _ = drop_specks(current, grid, cfg.min_fragment_mm())
+        if tier == 1:
+            # Fuer die zweite Stufe -- die, die eine Klingensaeule kappen darf
+            # -- zaehlen nur Bruchstuecke, die es wert sind. Ein Splitter von
+            # ein paar Voxeln rechtfertigt keinen Schnitt durch die
+            # Tragstruktur der Klinge; eine ganze Platte schon.
+            current, _ = drop_specks(current, grid,
+                                     4.0 * cfg.min_fragment_mm())
+        if count_components(current) <= 1:
+            break
+        room = room_beside(reserved)
+        linked, link_info = repair_connectivity(
+            current, room & ~current, grid, steps)
+        new_paths = linked & ~current
+        ejector_paths |= new_paths
+        if tier == 1:
+            forced_paths |= new_paths
+        resolved += link_info["links_added"]
+    info["ejector_conflicts_resolved"] = resolved
+
+    # Und jetzt gibt die Klinge tatsaechlich her, was diese Wege brauchen.
+    # Ohne diesen Schritt war die ganze Suche folgenlos: der Ausstoesser ist
+    # am Ende das Komplement der Klinge, also wird ein Weg, der durch
+    # Klingenmaterial fuehrt, beim Freischneiden einfach wieder zugemacht.
+    # Freigegeben wird der ganze Spaltkorridor um den Weg, sonst laege der
+    # Ausstoesser danach zu dicht an der Klinge und wuerde erneut
+    # weggeschnitten.
+    if ejector_paths.any():
+        corridor = (dilate_xy(ejector_paths, clearance + margin, grid)
+                    & blade & ~blade_protect)
+        # Nur die Wege der zweiten Stufe duerfen eine Klingensaeule kappen --
+        # sie sind die, fuer die es daneben nachweislich keinen Platz gab.
+        corridor &= ~blade_structure | dilate_xy(
+            forced_paths, clearance + margin, grid)
+        blade &= ~corridor
+        info["blade_yielded_voxels"] += int(corridor.sum())
+
+    # -- 5. Und die Gegenrichtung -----------------------------------------
+    # Die Klinge darf sich zurueckholen, was der Ausstoesser nicht braucht.
+    # Die Korridore haben ihr Netzwerk stellenweise durchtrennt; geflickt
+    # wird das JETZT, solange noch Platz dafuer ist. Spaeter geht es nicht
+    # mehr: dann steht der Ausstoesser ueberall dicht an der Klinge, und ihr
+    # bleibt nirgends mehr Raum fuer einen Steg.
+    #
+    # Tabu ist nur, was der Ausstoesser wirklich braucht: seine Platten und
+    # deren Verbindungen. Sein Netzwerk in der Tiefe ist frei verhandelbar --
+    # es ist dreidimensional und findet einen Weg daneben.
+    # Vorher wird der Klingenstaub weggeraeumt. Der Freischnitt laesst
+    # regelmaessig tausende Splitter von ein bis zwei Voxeln stehen -- hier
+    # gemessen 5651 Fragmente --, und die Verbindungssuche zieht zu jedem
+    # einzelnen einen Steg. Jeder dieser Stege steht anschliessend im Weg des
+    # Ausstoessers und trennt ihn erneut auf: der Ausstoesser zerfiel dadurch
+    # von 13 auf 20 Teile, und das fuer Splitter, die im Bauteil ohnehin
+    # nichts verloren haben.
+    blade, speck_info = drop_specks(blade, grid, cfg.min_fragment_mm(),
+                                    protect=blade_protect | blade_structure)
+    info["blade_specks_removed"] = speck_info["specks_removed"]
+    info["blade_speck_voxels"] = speck_info["speck_voxels"]
+
+    ejector_essential = plate_columns | plate_slab | ejector_paths
+    room_for_blade = (~dilate_xy(ejector_essential, clearance + margin, grid)
+                      & ~dilate_3d(ejector_essential, cfg.print_clearance_mm,
+                                   grid))
+    # Mit dem vollen Budget, nicht dem lokalen: hier flickt die Klinge ihr
+    # EIGENES Netzwerk, und ein Riss darin ist nicht lokal. Am echten Bild
+    # (188 mm hoch, 0.9 mm Masche) sind die 13 Schritte des lokalen Budgets
+    # gerade ein Zehntel Millimeter weit gekommen, und die Schneide verliess
+    # die Aufteilung in 59 Teilen.
+    blade_before_relink = blade
+    blade, link_info = repair_connectivity(blade, room_for_blade & ~blade,
+                                           grid, cfg.max_link_steps)
+    blade_paths = blade & ~blade_before_relink
+    info["blade_relinked"] = link_info["links_added"]
+    info["blade_relink_voxels"] = link_info["link_voxels"]
+
+    # -- 6. Zweite Runde -- und die letzte ---------------------------------
+    # Die Stege der Klinge haben den Ausstoesser stellenweise erneut
+    # zerschnitten (gemessen von 13 auf 20 Teile, bevor der Klingenstaub
+    # weggeraeumt wurde). Also wird noch einmal nachgeschaut -- diesmal mit
+    # den Stegen der Klinge als Tabu.
+    #
+    # Danach ist Schluss, und das ist keine Willkuer, sondern der Grund,
+    # warum es nicht endlos hin und her geht: dieser Durchgang nimmt der
+    # Klinge nichts mehr weg, was sie zusammenhaelt -- weder Muster noch
+    # Saeulen noch die eben gezogenen Stege --, nur noch Fuellung. Ihr
+    # Zusammenhang kann also nicht wieder aufbrechen, und eine dritte Runde
+    # haette nichts zu tun.
+    reserved_blade = blade_protect | blade_structure | blade_paths
+    current = complement_of(blade)
+    current, _ = drop_specks(current, grid, cfg.min_fragment_mm())
+    second = 0
+    if count_components(current) > 1:
+        room = room_beside(reserved_blade)
+        linked, link2 = repair_connectivity(
+            current, room & ~current, grid, cfg.max_link_steps)
+        second = link2["links_added"]
+        again = linked & ~current
+        if again.any():
+            blade &= ~(dilate_xy(again, clearance + margin, grid)
+                       & blade & ~reserved_blade)
+            ejector_paths |= again
+    info["ejector_second_round"] = second
+
+    # -- 7. Der Ausstoesser ist, was danach uebrig bleibt ------------------
+    ejector = complement_of(blade)
+
+    # Stuetzen fuer JEDE Zelle, die sonst in der Luft haengt -- nicht nur
+    # fuer die Saeulenspitzen. Der Grund steht in den Zahlen: der
+    # Ausstoesser ging mit 1365 schwebenden Voxeln in die Reparatur und kam
+    # mit 33903 GELOESCHTEN heraus. Schwebendes Material wird naemlich
+    # kaskadierend abgetragen -- faellt eine Zelle, verliert die darueber
+    # ihre Auflage --, und so kostet eine Handvoll Anfangsfehler zwei
+    # Drittel des Koerpers.
+    #
+    # Die Ursache ist der Spalt selbst: im ungetrennten Gyroid stuetzen sich
+    # die beiden Haelften gegenseitig; sobald 1.5 mm Luft dazwischen kommen,
+    # steht jede Haelfte allein da und hat dort Ueberhaenge, wo vorher die
+    # andere trug. Eine senkrechte Stuetze bis zur Druckplatte kostet ein
+    # paar Voxel, druckt mit 0 Grad Ueberhang und ersetzt genau diese
+    # verlorene Auflage.
+    # Gestuetzt wird das PRODUKT, nicht die Fuellung. Eine Stuetze unter
+    # jede schwebende Gyroid-Zelle waere zu viel des Guten: gemessen 10013
+    # zusaetzliche Voxel, die dem Ausstoesser zwar den Auftrieb gaben, der
+    # Schneide aber den Platz fuer ihre eigenen Reparaturen nahmen -- sie
+    # zerfiel darauf in 46 Teile. Die Platten dagegen sind das, womit der
+    # Ausstoesser das Teil herausdrueckt; faellt eine von ihnen der
+    # Trimmung zum Opfer, ist der Zylinder an dieser Stelle funktionslos.
+    room_for_pillars = complement_of(blade)
+    tips = (ejector & plate_slab
+            & ~support_map(ejector, grid, cfg.max_overhang_deg))
+    # Nicht durch die Nabe: dort wird spaeter die Achsbohrung
+    # herausgeschnitten, und eine Stuetze, die dort endet, wird mit ihr
+    # entfernt -- samt allem, was auf ihr stand. Sie enden deshalb auf dem
+    # Nabenradius, so wie die Klingensaeulen auch.
+    r_cells = grid.r_centers()
+    room_for_pillars &= (r_cells >= cfg.hub_radius())[None, None, :]
+    ejector_pillars = pillars_to_the_plate(tips, ejector, grid,
+                                           cfg.max_overhang_deg)
+    ejector_pillars &= room_for_pillars
+    ejector |= ejector_pillars
+    ejector_structure = (plate_columns | ejector_pillars) & ejector
+    # Geschuetzt ist beim Ausstoesser dasselbe wie bei der Klinge: sein
+    # Produkt und die Wege, die es tragen -- die Platten, ihre
+    # Verbindungssaeulen und deren Stuetzen. Nur ein duennes Band zu
+    # schuetzen genuegt nicht: die Platte haengt an dem, was unter ihr
+    # steht, und wenn das weggetrimmt wird, faellt sie mit. Gemessen verlor
+    # der Ausstoesser so 22 % seines Volumens und zerfiel unterwegs in 128
+    # Teile.
+    # Geschuetzt ist das Plattenband -- die Zellen, mit denen der
+    # Ausstoesser das Teil wirklich herausdrueckt -- und die Wege dorthin.
+    # Nicht der ganze Plattenblock bis in die Tiefe: der ist Struktur, und
+    # Struktur muss verhandelbar bleiben, sonst kann keine Reparatur mehr
+    # aufraeumen (gemessen sank der Ausstoesser dann auf ein Siebtel seines
+    # Volumens, weil ihm nur noch Nabenmaterial blieb).
+    ejector_protect = ejector & (
+        (depth < cfg.cut_depth_mm + 2 * grid.voxel_mm) | ejector_structure)
+
+    info.update({
+        "blade_columns_voxels": int(blade_columns.sum()),
+        "blade_pillar_voxels": int(blade_pillars.sum()),
+        "plate_columns_voxels": int(plate_columns.sum()),
+        "ejector_pillar_voxels": int(ejector_pillars.sum()),
         "blade_shaved_voxels": int(shave.sum()),
-        "support_pillar_voxels": int(pillars.sum()),
         "ejector_clearance_mm": round(clearance, 2),
         "blade_shave_mm": round(shave_mm, 2),
         "pocket_depth_mm": cfg.cut_depth_mm,
-        "protect": protect,
-        "structure": continuity["columns"] | pillars,
+        "blade_protect": blade_protect | blade_structure,
+        "blade_structure": blade_structure,
+        "ejector_protect": ejector_protect,
+        "ejector_structure": ejector_structure,
         "blade2d": blade2d,
-    }
+    })
+    return blade, ejector, info
 
 
 def build_state_field(blade_mask2d: np.ndarray, grid: CylGrid,
@@ -2353,20 +2693,20 @@ def build_gyroid_dual_cylinder(blade_mask2d: np.ndarray, radius_mm: float,
                    | dilate_3d(other, cfg.print_clearance_mm, grid))
         return ~blocked
 
-    protect_blade = report["split"].pop("protect")
-    structure_blade = report["split"].pop("structure")
+    protect_blade = report["split"].pop("blade_protect")
+    structure_blade = report["split"].pop("blade_structure")
+    protect_ejector = report["split"].pop("ejector_protect")
+    structure_ejector = report["split"].pop("ejector_structure")
     pattern2d = report["split"].pop("blade2d")
     depth = grid.depth_centers()
-    # Fuer den Ausstoesser gibt es im Aussenband nichts zu schuetzen: dort
-    # ist die Teigtasche, da steht ohnehin kein Material von ihm.
-    protect = np.zeros(grid.shape, dtype=bool)
 
     repairs: dict = {}
     # Reihenfolge: erst der Ausstoesser (er bewegt sich und traegt die Nabe),
     # dann die Schneide gegen den FERTIGEN Ausstoesser -- so kann die zweite
     # Reparatur die erste nicht wieder verletzen.
     ejector, repairs["ejector"] = repair_body(
-        ejector, allowed_for(blade), protect, grid, cfg)
+        ejector, allowed_for(blade), protect_ejector, grid, cfg,
+        restore=structure_ejector)
     # Die Saeulen und Stuetzen unter dem Muster TRAGEN es, sind aber
     # ersetzbar: darf eine Reparatur sie nicht anfassen, bleibt jeder
     # Kantenkontakt, den sie verursachen, fuer immer stehen und das Mesh
@@ -2375,6 +2715,48 @@ def build_gyroid_dual_cylinder(blade_mask2d: np.ndarray, radius_mm: float,
     blade, repairs["blade"] = repair_body(
         blade, allowed_for(ejector), protect_blade, grid, cfg,
         restore=structure_blade)
+
+    # -- Letzte Schlichtung ------------------------------------------------
+    # Der Ausstoesser kann die Reparatur in mehreren Teilen verlassen: das
+    # Trimmen traegt die Gyroid-Fuellung unter seinen Platten ab (gemessen
+    # 30399 Voxel), und was dann noch an der Mantelflaeche haengt, steht
+    # allein da -- hier drei Plattenbloecke von 887, 653 und 1624 mm3 im
+    # oberen Drittel. Aus der Aufteilung heraus ist das nicht zu verhindern,
+    # denn es entsteht erst in der Reparatur.
+    #
+    # Also wird hier noch einmal geschlichtet, nach derselben Rangfolge wie
+    # vorher: der Ausstoesser bekommt seinen Weg, und die Klinge gibt dafuer
+    # FUELLUNG her -- Muster und Saeulen nie. Danach wird sie nachgebessert.
+    # Bringt das die Klinge nicht heil wieder zusammen, bleibt alles beim
+    # Alten: lieber ein Ausstoesser in mehreren Teilen (das steht im Report)
+    # als eine zerlegte Schneide, denn die Schneide ist das Produkt.
+    if count_components(ejector) > 1:
+        keep = (blade, ejector, dict(repairs))
+        reserved = protect_blade | structure_blade
+        margin = grid.voxel_mm / 2.0
+        room = (~dilate_xy(reserved, cfg.clearance_mm() + margin, grid)
+                & ~dilate_3d(reserved, cfg.print_clearance_mm, grid))
+        room[:, :, depth < cfg.cut_depth_mm] = False
+        linked, last_link = repair_connectivity(
+            ejector, room & ~ejector, grid, cfg.max_link_steps)
+        bridges = linked & ~ejector
+        if bridges.any():
+            blade = blade & ~(dilate_xy(bridges, cfg.clearance_mm() + margin,
+                                        grid) & ~reserved)
+            blade, repairs["blade_again"] = repair_body(
+                blade, allowed_for(linked), protect_blade, grid, cfg,
+                restore=structure_blade)
+            ejector, repairs["ejector_again"] = repair_body(
+                linked, allowed_for(blade), protect_ejector, grid, cfg,
+                restore=structure_ejector)
+            if (repairs["blade_again"]["components"]
+                    > repairs["blade"]["components"]
+                    or count_components(ejector)
+                    >= count_components(keep[1])):
+                blade, ejector, repairs = keep
+            else:
+                repairs["final_links_added"] = last_link["links_added"]
+
     report["repairs"] = repairs
 
     # -- Achsbohrung ganz zum Schluss -------------------------------------
@@ -2392,13 +2774,18 @@ def build_gyroid_dual_cylinder(blade_mask2d: np.ndarray, radius_mm: float,
         ejector[:, :, bore] = False
         # Die Bohrung kann Material am Bohrungsrand die (diagonale) Auflage
         # nehmen -- eine Zelle, die schraeg ueber einer Bohrungszelle stand,
-        # steht danach in der Luft. Also einmal nachstuetzen und aufraeumen;
-        # das ist ein kurzer Durchlauf, weil es nur um den Bohrungsrand geht.
+        # steht danach in der Luft. Also einmal nachstuetzen und aufraeumen.
+        #
+        # MIT demselben Schutz wie vorher. Ohne ihn trimmt dieser Durchlauf
+        # genau die Zellen weg, die die eigentliche Reparatur bewusst stehen
+        # gelassen hat, und die Kaskade daraus kostete den Ausstoesser ein
+        # Viertel seines Materials (8485 Voxel).
         blade, sup_b = repair_support(blade, allowed_for(ejector), grid,
                                       cfg.max_overhang_deg,
                                       protect=protect_blade)
         ejector, sup_e = repair_support(ejector, allowed_for(blade), grid,
-                                        cfg.max_overhang_deg)
+                                        cfg.max_overhang_deg,
+                                        protect=protect_ejector)
         for name, sup in (("blade", sup_b), ("ejector", sup_e)):
             sup.pop("trimmed_mask", None)
             repairs[name]["support_voxels_added"] += sup["support_voxels_added"]
@@ -2413,11 +2800,14 @@ def build_gyroid_dual_cylinder(blade_mask2d: np.ndarray, radius_mm: float,
     for occ_name in ("blade", "ejector"):
         occ = blade if occ_name == "blade" else ejector
         other = ejector if occ_name == "blade" else blade
+        keep = protect_blade if occ_name == "blade" else protect_ejector
         if count_edge_contacts(occ) == 0:
             continue
+        # Muster und Platten bleiben auch hier tabu. Was dadurch als Kontakt
+        # stehen bleibt, loest das Vernetzen auf, indem es die geteilte Ecke
+        # aufspaltet -- eine Darstellungsfrage kostet kein Bauteil.
         occ, info = resolve_diagonal_contacts(
-            occ, allowed_for(other), np.zeros(grid.shape, dtype=bool), grid,
-            cfg.max_overhang_deg)
+            occ, allowed_for(other), keep, grid, cfg.max_overhang_deg)
         occ, _ = trim_floating(occ, grid, cfg.max_overhang_deg)
         repairs[occ_name]["diagonal_contacts_separated"] += info[
             "diagonal_contacts_separated"]
@@ -2425,6 +2815,46 @@ def build_gyroid_dual_cylinder(blade_mask2d: np.ndarray, radius_mm: float,
             blade = occ
         else:
             ejector = occ
+
+    # -- Genau zwei Koerper, notfalls auf Kosten einer Platte --------------
+    # Und zwar GANZ am Ende, nach dem Aufloesen der Kantenkontakte. Deren
+    # Trimmen ist der letzte Schritt, der noch Material wegnimmt, und damit
+    # der letzte, der neue lose Teile hinterlassen kann -- davor gesetzt
+    # hatte dieser Schritt acht Teile abgeworfen und stand danach wieder vor
+    # neun. Umgekehrt kann das Abwerfen ganzer Teile keinen neuen
+    # Kantenkontakt erzeugen: es nimmt nur weg, und zwar zusammenhaengend.
+    # Wenn nach allen Reparaturen und der Schlichtung immer noch Teile des
+    # Ausstoessers lose sind, ist das kein Darstellungsproblem: sie liegen im
+    # fertigen Druck als eigene Stuecke im Bauteil. Erreichbar sind sie
+    # nachweislich nicht -- die Schlichtung hat einen Weg gesucht und keinen
+    # gefunden, der zugleich anbindet und druckbar ist.
+    #
+    # Also fallen sie weg. Ein Zylinder, dem an ein paar Stellen Platte
+    # fehlt, drueckt dort etwas schwaecher; ein Zylinder mit drei losen
+    # Bloecken darin ist Ausschuss. Was das kostet, steht als Volumen im
+    # Report -- die Schneide bleibt davon unberuehrt, ihr Muster ist zu
+    # diesem Zeitpunkt bereits vollstaendig.
+    # Dasselbe gilt fuer die letzten schwebenden Zellen. Bis hierher standen
+    # die Platten unter Schutz, damit die Reparaturen sie nicht kaskadierend
+    # abtragen. Der Schutz hat seinen Zweck erfuellt; was jetzt noch ohne
+    # Auflage dasteht, waere im Druck ein Faden in der Luft. Also faellt auch
+    # das -- und weil das Abtragen neue lose Teile hinterlassen kann, laufen
+    # beide Schritte abwechselnd, bis sich nichts mehr aendert.
+    voxel_volume = grid.voxel_volume()
+    dropped = np.zeros(grid.shape, dtype=bool)
+    parts_dropped = 0
+    labels, n_parts = label_periodic(ejector)
+    if n_parts > 1:
+        weights = np.array(
+            [float((voxel_volume[None, None, :] * (labels == i)).sum())
+             for i in range(1, n_parts + 1)])
+        main = int(np.argmax(weights)) + 1
+        dropped = ejector & (labels != main)
+        parts_dropped = int(n_parts - 1)
+        ejector = ejector & ~dropped
+    report["ejector_volume_dropped_mm3"] = float(
+        (voxel_volume[None, None, :] * dropped).sum())
+    report["ejector_parts_dropped"] = parts_dropped
 
     # Vollstaendigkeit des Musters, am FERTIGEN Koerper gemessen: welcher
     # Anteil der Klingenpixel taucht im Aussenband wirklich auf? Das ist die
@@ -2485,6 +2915,15 @@ def build_gyroid_dual_cylinder(blade_mask2d: np.ndarray, radius_mm: float,
     if result["ejector_bodies"] != 1:
         warnings.append(
             f"Der Ausstoesser besteht aus {result['ejector_bodies']} Teilen."
+        )
+    if report.get("ejector_parts_dropped"):
+        warnings.append(
+            f"{report['ejector_parts_dropped']} Ausstoesserteile mit zusammen "
+            f"{report['ejector_volume_dropped_mm3']:.0f} mm3 waren im "
+            f"Bewegungsspalt der Klinge weder anzubinden noch zu stuetzen und "
+            f"wurden entfernt -- dort drueckt der Ausstoesser schwaecher. "
+            f"Ein groesserer Radius oder eine geringere Schneidentiefe "
+            f"schaffen ihm mehr Platz."
         )
     for label, key in (("Schneide", "blade"), ("Ausstoesser", "ejector")):
         if result[f"{key}_floating_voxels"]:

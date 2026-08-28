@@ -101,6 +101,22 @@ und **nachgemessen**: der Report nennt fuer jede Bedingung das Ergebnis
 (Anzahl Koerper, schwebende Voxel, eingehaltener Hub, Wandstaerke, verlorene
 Musterflaeche) statt sie nur zu behaupten.
 
+**Der Ausstoesser wird zuerst versorgt, wo es eng wird.** Die Reihenfolge
+ist: Muster und Saeulen der Schneide festlegen, dann die Platten des
+Ausstoessers und ihre Verbindung nach innen, dann die Konflikte. Wo beide
+denselben Weg brauchen, wird die Trennflaeche selbst verschoben, bevor
+Klingenmaterial entsteht -- eine Verbindung an der Unterkante einer Platte
+wird dringender gebraucht als ein weiteres Stueck Fuellung an einer
+Schneide, die dort ohnehin schon haengt. Aus dem fertigen Koerper Korridore
+herauszuschneiden waere das Gegenteil: es laesst die Saeulen als Inseln im
+Loch stehen und zerlegt die Schneide.
+
+Bleibt danach ein Plattenstueck uebrig, das im Bewegungsspalt der Schneide
+weder anzubinden noch zu stuetzen ist, wird es **aufgegeben** statt als
+loses Teil mitgedruckt: genau zwei Koerper ist die Bedingung, an der das
+Bauteil haengt. Wie viel das kostet, nennt der Report als
+``ejector_volume_dropped_mm3`` und die App als Hinweis.
+
 Der Radius hat dabei eine **Untergrenze** (Schneidentiefe + Nabe + vier
 Maschenmasse, mit den Voreinstellungen rund 27 mm): darunter bleibt zwischen
 Nabe und Schneidentiefe zu wenig Platz fuer die Gyroid-Zone, und der

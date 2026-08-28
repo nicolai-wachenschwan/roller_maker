@@ -804,6 +804,17 @@ with col1:
                             f"{ejector_report['blade_wall_ratio'] * 100:.0f} % / "
                             f"{ejector_report['ejector_wall_ratio'] * 100:.0f} %"
                         )
+                        dropped = ejector_report.get(
+                            "ejector_volume_dropped_mm3", 0.0)
+                        if dropped > 0:
+                            st.caption(
+                                f"Aufgegeben: "
+                                f"{ejector_report.get('ejector_parts_dropped', 0)} "
+                                f"Ausstoesserteile mit zusammen {dropped:.0f} mm³ "
+                                f"waren weder anzubinden noch zu stuetzen und "
+                                f"wurden entfernt -- der Ausstoesser drueckt dort "
+                                f"schwaecher, bleibt dafuer ein Stueck."
+                            )
                         reps = ejector_report.get("repairs", {})
                         for label, key in (("Schneide", "blade"),
                                            ("Ausstoesser", "ejector")):
