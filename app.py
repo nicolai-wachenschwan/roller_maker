@@ -88,6 +88,7 @@ def ejector_min_radius():
     axis = (st.session_state.get('axis_diameter', 6.0)
             if st.session_state.get('create_axis_hole', True) else None)
     cfg = CoexistenceConfig(
+        voxel_mm=st.session_state.get('ejector_voxel_mm', 0.9),
         travel_mm=st.session_state.get('ejector_travel', 3.0),
         cut_depth_mm=st.session_state.get('ejector_cut_depth', 4.0),
         min_wall_mm=st.session_state.get('ejector_min_wall', 1.2),
@@ -439,25 +440,15 @@ with st.sidebar:
         help="Enter the width to set the radius accordingly, respecting image aspect ratio"
     )
 
-    min_radius = ejector_min_radius()
-    if st.session_state.radius < min_radius:
-        # Der Regler wuerde sonst mit einem Wert ausserhalb seines Bereichs
-        # erzeugt. Anheben statt abweisen: der Benutzer hat den Radius nicht
-        # zu klein gewaehlt, sondern die Auswerfer-Einstellungen zu gross.
-        st.session_state.radius = min_radius
     st.slider(
         "Base Radius (in mm)",
-        min_radius,
+        10.0,
         100.0,
         key='radius',
         step=0.5,
-        help=(f"Untergrenze {min_radius:.1f} mm: darunter passen "
-              f"Schneidentiefe, Ueberblendung, eine Gyroid-Masche, der "
-              f"Abstand zur Nabe und die Nabe selbst nicht mehr in den "
-              f"Querschnitt. Kleiner wird es nur mit kleinerem Hub, "
-              f"geringerer Schneidentiefe oder duennerer Achse."
-              if st.session_state.get('generate_ejector_system', True)
-              else "Grundradius des Zylinders.")
+        help="Grundradius des Zylinders. Der Zweiteiler braucht eine "
+             "Untergrenze -- sie steht bei den Auswerfer-Einstellungen und "
+             "haengt von Hub, Schneidentiefe und Achse ab."
     )
     radius = st.session_state.radius
     displacement = st.slider("Radial Displacement (Wall Thickness in mm)", 0.5, 10.0, 2.0, 0.1)
@@ -487,6 +478,7 @@ with st.sidebar:
              "eine Achsbohrung.",
         key="generate_ejector_system",
     )
+    radius_too_small = False
     if generate_ejector_system:
         ejector_threshold = st.slider(
             "Klingen-Schwellwert (Helligkeit)", 0, 255, 128, 1,
@@ -495,11 +487,11 @@ with st.sidebar:
         )
         ejector_travel = st.slider(
             "Auswerferhub (mm)", 0.5, 6.0, 3.0, 0.1,
-            help="So weit laesst sich der exzentrisch gelagerte Ausstoesser "
-                 "in der XY-Ebene verschieben. Derselbe Wert ist der "
-                 "Freiraum, der ueberall zwischen beiden Koerpern bleiben "
-                 "muss -- er bestimmt damit auch, wie grob die "
-                 "Gyroid-Struktur im Inneren ausfaellt.",
+            help="Der volle Weg, den eine Ausstoesserplatte zuruecklegt. Der "
+                 "Ausstoesser sitzt exzentrisch und wandert aus seiner "
+                 "Mittellage um die HALBE Strecke nach jeder Seite -- so viel "
+                 "Freiraum muss ueberall zwischen beiden Koerpern bleiben, "
+                 "und so grob faellt die Gyroid-Struktur im Inneren aus.",
             key="ejector_travel",
         )
         ejector_cut_depth = st.slider(
@@ -542,6 +534,24 @@ with st.sidebar:
                      "Haelften nach dem Freischneiden des Hubs noch "
                      "zusammenhaengen.",
                 key="ejector_period",
+            )
+        # Untergrenze fuer den Radius. Bewusst als SPERRE und nicht als
+        # Slider-Minimum: aendert man das Minimum eines Reglers mit Key,
+        # setzt Streamlit seinen Wert auf eben dieses Minimum zurueck -- der
+        # Radius waere dann bei jeder Aenderung an Hub oder Achse
+        # unbemerkt auf die Untergrenze gesprungen.
+        ejector_radius_min = ejector_min_radius()
+        radius_too_small = radius < ejector_radius_min
+        if radius_too_small:
+            st.error(
+                f"⛔ Radius {radius:.1f} mm ist zu klein fuer diese "
+                f"Einstellungen -- mindestens {ejector_radius_min:.1f} mm. "
+                f"Zwischen Nabe und Schneidentiefe bleibt sonst zu wenig "
+                f"Platz fuer die Gyroid-Zone, in der sich die "
+                f"eingeschlossenen Musterflaechen verbinden; der Ausstoesser "
+                f"kaeme in mehreren Teilen heraus. Abhilfe: groesserer "
+                f"Radius, kleinerer Hub, geringere Schneidentiefe, duennere "
+                f"Achse oder feineres Voxelgitter."
             )
         if not create_axis_hole:
             st.warning("⚠️ Der Ausstoesser benoetigt eine Achsbohrung "
@@ -683,7 +693,8 @@ with col1:
             st.session_state.shell_filename = f"{base_filename}_r{int(radius)}_schneide.stl"
             st.session_state.core_filename = f"{base_filename}_r{int(radius)}_ausstoesser.stl"
 
-        generate_disabled = generate_ejector_system and not create_axis_hole
+        generate_disabled = generate_ejector_system and (
+            not create_axis_hole or radius_too_small)
         if st.button("🚀 Generate 3D Model", use_container_width=True, type="primary",
                      disabled=generate_disabled, key="generate_button"):
             status_placeholder = st.empty()
@@ -761,10 +772,19 @@ with col1:
                             )
                         with col_c:
                             st.metric(
-                                "Schwebende Voxel (Soll: 0)",
-                                f"{ejector_report['blade_floating_voxels']} / "
-                                f"{ejector_report['ejector_floating_voxels']}",
+                                "Muster vollstaendig",
+                                f"{ejector_report['pattern_completeness'] * 100:.1f} %",
+                                help="Anteil der Klingenpixel, die im "
+                                     "fertigen Koerper wirklich auftauchen. "
+                                     "Soll: 100 %.",
                             )
+                        st.caption(
+                            f"Schwebende Voxel (Soll je 0): "
+                            f"{ejector_report['blade_floating_voxels']} / "
+                            f"{ejector_report['ejector_floating_voxels']} · "
+                            f"Auslenkung ±"
+                            f"{ejector_travel / 2:.2f} mm bei {ejector_travel:.1f} mm Hub"
+                        )
                         gyroid = ejector_report.get("gyroid", {})
                         st.caption(
                             f"Gyroid: Periode {gyroid.get('period_mm', '?')} mm, "

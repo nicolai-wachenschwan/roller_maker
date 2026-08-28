@@ -87,19 +87,27 @@ Zwei Prinzipien tragen den Aufbau:
 
 Beides wird in einem einzigen Skalarfeld zusammengefuehrt, dessen Vorzeichen
 den Bauraum teilt; der Bewegungsspalt entsteht anschliessend durch Erosion
-beider Haelften und ist damit exakt statt geschaetzt. Was danach noch offen
+und ist damit exakt statt geschaetzt. Gefordert ist dabei die HALBE
+Hubstrecke: der Ausstoesser sitzt exzentrisch und wandert aus seiner
+Mittellage um +-Hub/2.
+
+**Das Muster geht vollstaendig ins Bauteil.** Jedes Klingenpixel taucht im
+fertigen Koerper auf -- der Spalt kommt im Aussenband ausschliesslich vom
+Ausstoesser, jede Klingenlinie bekommt eine durchgehende Saeule bis zu ihrem
+eigenen Netzwerk, und die Musterzellen sind vor jeder Reparatur geschuetzt.
+``pattern_completeness`` im Report misst es. Was danach noch offen
 ist -- schwebendes Material, lose Fragmente, Kantenkontakte -- wird repariert
 und **nachgemessen**: der Report nennt fuer jede Bedingung das Ergebnis
 (Anzahl Koerper, schwebende Voxel, eingehaltener Hub, Wandstaerke, verlorene
 Musterflaeche) statt sie nur zu behaupten.
 
-Der Radius hat dabei eine **Untergrenze**, die sich aus den Einstellungen
-ergibt (Schneidentiefe + Ueberblendung + eine Gyroid-Masche + Abstand zur
-Nabe + Nabe selbst, mit den Voreinstellungen 24.5 mm). Darunter bleibt fuer
-die Gyroid-Zone weniger als eine Masche uebrig, und eingeschlossene
-Musterflaechen finden in der Tiefe keinen Weg mehr zueinander -- eine Frage
-des Platzes, die auch feinere Voxel nicht loesen. Der Regler laesst kleinere
-Werte deshalb gar nicht erst zu.
+Der Radius hat dabei eine **Untergrenze** (Schneidentiefe + Nabe + vier
+Maschenmasse, mit den Voreinstellungen rund 27 mm): darunter bleibt zwischen
+Nabe und Schneidentiefe zu wenig Platz fuer die Gyroid-Zone, und der
+Ausstoesser kaeme in mehreren Teilen heraus. Die App sperrt den
+Generieren-Knopf und nennt den Grund. Ebenso muss die Voxelkante deutlich
+unter dem Spalt liegen -- sonst frisst die Diskretisierung ihn auf; zu grobe
+Werte werden automatisch verfeinert und gemeldet.
 
 ## 💻 Technologies Used
 

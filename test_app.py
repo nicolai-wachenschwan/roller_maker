@@ -34,7 +34,7 @@ APP_TIMEOUT = 60
 EJECTOR_TIMEOUT = 900
 
 
-def _set_coarse_voxels(at, voxel_mm: float = 1.6):
+def _set_coarse_voxels(at, voxel_mm: float = 1.2):
     """Voxelgitter vergroebern, damit ein Test in Sekunden statt Minuten
     laeuft. Die Voxelgroesse aendert die Physik nicht -- nur wie fein sie
     abgetastet wird."""
@@ -269,8 +269,10 @@ def test_ejector_parts_really_do_not_touch():
         f"{abs(overlap.volume):.3f} mm3"
     )
 
-    # Verschiebung in acht Richtungen der XY-Ebene um den vollen Hub.
-    travel = at.slider(key="ejector_travel").value
+    # Auslenkung in acht Richtungen der XY-Ebene. Gefordert ist die HALBE
+    # Hubstrecke: der Ausstoesser sitzt exzentrisch und wandert aus seiner
+    # Mittellage um +-travel/2.
+    travel = at.slider(key="ejector_travel").value / 2.0
     for angle in np.linspace(0, 2 * np.pi, 8, endpoint=False):
         moved = ejector.copy()
         moved.apply_translation(
@@ -281,42 +283,58 @@ def test_ejector_parts_really_do_not_touch():
         # Eine Voxelecke Ueberschneidung ist Diskretisierung, kein Klemmen;
         # gemessen wird gegen das Volumen der Koerper.
         assert volume < 0.002 * abs(ejector.volume), (
-            f"Bei Verschiebung um {travel} mm in Richtung "
+            f"Bei Auslenkung um {travel} mm in Richtung "
             f"{np.degrees(angle):.0f} Grad klemmt der Ausstoesser "
             f"({volume:.1f} mm3 Ueberschneidung)"
         )
 
 
 def test_radius_slider_locks_out_cylinders_that_are_too_small():
-    """Zu kleine Zylinder werden gar nicht erst angeboten: unterhalb der
-    Untergrenze bleibt fuer die Gyroid-Zone weniger als eine Masche uebrig.
-    Der Regler zieht seine Grenze aus denselben Einstellungen, mit denen
-    spaeter gerechnet wird -- wer den Hub verkleinert, darf auch kleiner
-    bauen."""
-    from gyroid_coexistence import CoexistenceConfig
+    """Zu kleine Zylinder werden gesperrt: unterhalb der Untergrenze bleibt
+    zwischen Nabe und Schneidentiefe zu wenig Platz fuer die Gyroid-Zone, und
+    der Ausstoesser kaeme in mehreren Teilen heraus.
 
+    Gesperrt wird ueber den Knopf, nicht ueber das Minimum des Reglers:
+    aendert man das Minimum eines Reglers mit Key, setzt Streamlit dessen
+    WERT auf eben dieses Minimum -- der Radius waere dann bei jeder
+    Aenderung an Hub oder Achse unbemerkt gesprungen (im Test von 30 auf
+    28.5 mm)."""
     at = AppTest.from_file("app.py")
     at.run(timeout=APP_TIMEOUT)
     at = _run_with_uploaded_image(at)
     assert not at.exception
 
-    expected = CoexistenceConfig().min_radius_mm()
-    slider = at.slider(key="radius")
-    assert slider.min == pytest.approx(expected, abs=0.5), (
-        f"Untergrenze des Radius ist {slider.min}, erwartet ~{expected:.1f}"
-    )
-    assert slider.value >= slider.min
+    from gyroid_coexistence import CoexistenceConfig
 
-    # Kleinerer Hub -> kleinere Untergrenze.
-    at.slider(key="ejector_travel").set_value(1.5)
+    # Radius unter die Untergrenze ziehen -> gesperrt.
+    too_small = CoexistenceConfig().min_radius_mm() - 2.0
+    at.slider(key="radius").set_value(round(too_small * 2) / 2)
     at.run(timeout=APP_TIMEOUT)
     assert not at.exception
-    assert at.slider(key="radius").min < expected
+    assert at.button(key="generate_button").disabled is True, (
+        "Ein zu kleiner Zylinder muss gesperrt sein"
+    )
+    assert any("zu klein" in e.value for e in at.error), (
+        "Die Sperre muss auch begruendet werden"
+    )
 
-    # Ohne Zweiteiler faellt die Beschraenkung ganz weg.
+    # Kleinerer Hub und geringere Schneidentiefe -> derselbe Radius geht
+    # wieder: die Untergrenze folgt den Einstellungen.
+    at.slider(key="ejector_travel").set_value(1.0)
+    at.slider(key="ejector_cut_depth").set_value(2.0)
+    at.run(timeout=APP_TIMEOUT)
+    assert not at.exception
+    assert at.button(key="generate_button").disabled is False, (
+        "Mit kleinerem Hub muss derselbe Radius wieder erlaubt sein"
+    )
+
+    # Ohne Zweiteiler gilt die Beschraenkung gar nicht.
+    at.slider(key="ejector_travel").set_value(3.0)
+    at.slider(key="ejector_cut_depth").set_value(4.0)
+    at.run(timeout=APP_TIMEOUT)
     at.checkbox(key="generate_ejector_system").set_value(False)
     at.run(timeout=APP_TIMEOUT)
-    assert at.slider(key="radius").min == pytest.approx(10.0)
+    assert at.button(key="generate_button").disabled is False
 
 
 def test_ejector_system_requires_axis_hole():

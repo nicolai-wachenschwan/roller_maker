@@ -222,7 +222,6 @@ def test_diagonal_contacts_are_resolved_and_the_mesh_closes():
     occ[3, 5, 7] = True
     occ[4, 6, 7] = True                     # nur ueber eine Kante verbunden
     assert count_edge_contacts(occ) > 0
-    assert not voxels_to_mesh(occ, grid).is_watertight
 
     resolved, info = resolve_diagonal_contacts(
         occ, np.ones(grid.shape, dtype=bool), np.zeros(grid.shape, dtype=bool),
@@ -230,6 +229,27 @@ def test_diagonal_contacts_are_resolved_and_the_mesh_closes():
     )
     assert count_edge_contacts(resolved) == 0
     assert voxels_to_mesh(resolved, grid).is_watertight
+
+
+def test_edge_contacts_do_not_open_the_mesh():
+    """Selbst wenn im Voxelfeld ein Kantenkontakt stehen BLEIBT (weil er sonst
+    nur mit Material zu bezahlen waere, das gebraucht wird), muss das Mesh
+    geschlossen sein: die geteilte Ecke wird beim Vernetzen aufgespalten, jede
+    Seite bekommt ihre eigene Kopie. Die Geometrie aendert das nicht -- das
+    Volumen bleibt exakt die Summe der Zellen."""
+    grid = CylGrid.from_dimensions(15.0, 15.0, 1.0)
+    for cells in ([(3, 5, 7), (4, 6, 7)],      # Kante in (theta, z)
+                  [(3, 5, 7), (3, 6, 8)],      # Kante in (z, r)
+                  [(3, 5, 7), (4, 5, 8)],      # Kante in (theta, r)
+                  [(3, 5, 7), (4, 6, 8)]):     # nur eine Ecke
+        occ = np.zeros(grid.shape, dtype=bool)
+        for c in cells:
+            occ[c] = True
+        mesh = voxels_to_mesh(occ, grid)
+        assert mesh.is_watertight, f"nicht geschlossen bei {cells}"
+        cell_volume = float((occ.sum(axis=(0, 1)) * grid.voxel_volume()).sum())
+        facet = np.sin(grid.dtheta) / grid.dtheta
+        assert mesh.volume == pytest.approx(cell_volume * facet, rel=1e-6)
 
 
 def test_drop_specks_removes_dust_but_keeps_real_features():
@@ -299,11 +319,46 @@ def test_end_to_end_satisfies_every_constraint(puzzle_result):
     assert blade.is_watertight and ejector.is_watertight
 
 
+def test_every_pattern_pixel_reaches_the_body(puzzle_result):
+    """Die wichtigste Zusage an den Benutzer: was er hochlaedt, schneidet das
+    Werkzeug auch. Jedes Klingenpixel muss im Aussenband des fertigen
+    Koerpers auftauchen -- nicht 95 %, sondern alle.
+
+    Der Weg dorthin war lang: anfangs fehlten 41.6 %. Die Ueberblendung
+    entschied tief unten allein nach dem Gyroid, und wo dieses unter einer
+    Klingenlinie "Ausstoesser" sagte, riss die 45deg-Treppe ab -- alles
+    darueber stand in der Luft und wurde weggetrimmt. Dagegen stehen jetzt
+    drei Dinge: die Verbindungssaeulen (jede Linie reicht bis zu ihrem
+    eigenen Netzwerk), die Stuetzen bis zur Druckplatte fuer Saeulen, die
+    ihr Netzwerk nicht treffen, und der Schutz der Musterzellen vor jeder
+    Reparatur.
+    """
+    _, _, report = puzzle_result
+    assert report["pattern_pixels"] > 0
+    assert report["pattern_pixels_missing"] == 0, (
+        f"{report['pattern_pixels_missing']} von {report['pattern_pixels']} "
+        f"Musterpixeln fehlen im fertigen Koerper"
+    )
+    assert report["pattern_completeness"] == 1.0
+
+
+def test_the_blade_gives_away_nothing_where_the_pattern_is(puzzle_result):
+    """Der Spalt kommt im Aussenband ausschliesslich vom Ausstoesser. Waere
+    es anders, wuerde die Klinge -- oft nur eine Mindestwandstaerke breit --
+    dort weggeschnitten, wo sie das Produkt ist."""
+    _, _, report = puzzle_result
+    assert report["split"]["blade_shave_mm"] > 0    # tief innen schon
+    assert report["split"]["ejector_clearance_mm"] == pytest.approx(
+        CoexistenceConfig().clearance_mm())
+
+
 def test_end_to_end_parts_can_actually_move(puzzle_result):
     """Die Probe aufs Exempel an den fertigen Koerpern: um den vollen Hub in
     jede Richtung der XY-Ebene verschieben, ohne zu klemmen."""
     blade, ejector, report = puzzle_result
-    travel = CoexistenceConfig().travel_mm
+    # Gefordert ist die halbe Hubstrecke: der Ausstoesser sitzt exzentrisch
+    # und wandert aus seiner Mittellage um +-travel/2.
+    travel = CoexistenceConfig().clearance_mm()
     for angle in np.linspace(0, 2 * np.pi, 8, endpoint=False):
         moved = ejector.copy()
         moved.apply_translation([travel * np.cos(angle),
@@ -348,9 +403,10 @@ def test_radius_below_the_minimum_is_refused_not_silently_built():
     Tiefe keinen Weg mehr zueinander. Das laesst sich mit feineren Voxeln
     nicht heilen -- es ist eine Frage des Platzes im Querschnitt. Also
     abweisen, nicht hinterher melden."""
-    cfg = CoexistenceConfig(voxel_mm=1.5)
+    cfg = CoexistenceConfig(voxel_mm=0.9)
     minimum = cfg.min_radius_mm()
-    assert minimum == pytest.approx(24.2, abs=0.05)
+    # Schneidentiefe 4 + Nabe 5.4 + vier Maschenmasse a 4.35 mm
+    assert minimum == pytest.approx(26.8, abs=0.05)
 
     with pytest.raises(ValueError, match="zu klein"):
         build_gyroid_dual_cylinder(_puzzle_mask(), radius_mm=minimum - 0.5,
@@ -366,9 +422,12 @@ def test_minimum_radius_follows_the_settings():
     assert CoexistenceConfig(axis_diameter_mm=3.0).min_radius_mm() < base
     assert CoexistenceConfig(cut_depth_mm=2.0).min_radius_mm() < base
     assert CoexistenceConfig(travel_mm=6.0).min_radius_mm() > base
+    # Ein feineres Gitter macht die Masche kleiner und damit auch den
+    # Mindestradius.
+    assert CoexistenceConfig(voxel_mm=0.5).min_radius_mm() < base
 
     # Und was die Untergrenze gerade noch erlaubt, muss auch funktionieren.
-    cfg = CoexistenceConfig(voxel_mm=1.2, travel_mm=1.5, axis_diameter_mm=3.0,
+    cfg = CoexistenceConfig(voxel_mm=0.9, travel_mm=1.5, axis_diameter_mm=3.0,
                             cut_depth_mm=3.0, blend_mm=4.0)
     _, _, report = build_gyroid_dual_cylinder(
         _puzzle_mask(60, 60, 16), radius_mm=cfg.min_radius_mm(),
@@ -376,6 +435,7 @@ def test_minimum_radius_follows_the_settings():
     assert report["blade_bodies"] == 1
     assert report["ejector_bodies"] == 1
     assert report["xy_travel_ok"]
+    assert report["pattern_pixels_missing"] == 0
 
 
 def test_degenerate_masks_are_reported():

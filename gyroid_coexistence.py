@@ -28,14 +28,15 @@ XY-Ebene, druecken seine Platten auf der Seite, die gerade aus dem Teig
 laeuft, nach aussen. Daraus folgt die Bedingung, die den ganzen Aufbau
 bestimmt:
 
-    Eine Verschiebung des Ausstoessers um ``travel_mm`` (Default 3 mm) in
-    IRGENDEINE Richtung der XY-Ebene darf nirgends zu einer Beruehrung mit
-    der Schneide fuehren.
+    Eine Auslenkung des Ausstoessers um die HALBE Hubstrecke (Default 3 mm
+    Hub, also +-1.5 mm) in IRGENDEINE Richtung der XY-Ebene darf nirgends zu
+    einer Beruehrung mit der Schneide fuehren.
 
-In z bewegt sich nichts, dort genuegt Druckspiel. Geprueft wird das nicht per
-Formel, sondern gemessen (``check_xy_travel``): der Ausstoesser wird um
-``travel_mm`` in XY dilatiert; schneidet das Ergebnis die Schneide, ist die
-Bedingung verletzt.
+Die Haelfte, nicht die ganze Strecke: die Mittellage ist die Ruhelage, aus
+ihr wandert der Ausstoesser nach beiden Seiten. In z bewegt sich nichts, dort
+genuegt Druckspiel. Geprueft wird das nicht per Formel, sondern gemessen
+(``check_xy_travel``): der Ausstoesser wird um den Spalt in XY dilatiert;
+schneidet das Ergebnis die Schneide, ist die Bedingung verletzt.
 
 Grundprinzip 1: 45deg-Projektion nach innen
 --------------------------------------------
@@ -78,6 +79,31 @@ geschert; innen das Gyroid; dazwischen wird ueberblendet. Ein
 ``np.minimum`` mit einem radialen Kegel macht den Ausstoesser innen massiv
 (die Nabe) und haelt die Klinge von ihr fern.
 
+Das Muster ist das Produkt -- es geht vollstaendig ins Bauteil
+---------------------------------------------------------------
+Jedes Klingenpixel muss im Aussenband des fertigen Koerpers auftauchen. Das
+ist keine Selbstverstaendlichkeit, sondern die Bedingung, an der die ersten
+Fassungen gescheitert sind: die Ueberblendung entschied tief unten allein
+nach dem Gyroid, und wo dieses unter einer Klingenlinie "Ausstoesser" sagte,
+riss die 45deg-Treppe ab. Alles darueber stand in der Luft und wurde von der
+Stuetzreparatur weggetrimmt -- gemessen fehlten so 41.6 % der Klingenpixel.
+
+Drei Dinge halten das Muster jetzt:
+
+- ``enforce_blade_continuity``: jede Klingenlinie bekommt entlang ihres
+  45deg-Strahls eine durchgehende Saeule bis zu ihrem EIGENEN Netzwerk. Nicht
+  weiter -- ab dort traegt das Netzwerk.
+- Stuetzen bis zur Druckplatte fuer die Saeulen, die ihr Netzwerk nicht mehr
+  treffen (radial koennen sie nicht weiter, senkrecht schon).
+- Die Musterzellen sind vor jeder Reparatur geschuetzt. Geschuetzt sind die
+  ZELLEN, nicht der Bereich: sonst geniesst auch jedes Voxel Schutz, das
+  eine Reparatur spaeter dort hineinsetzt, und ein schwebender Steg im
+  Musterband liesse sich nie wieder entfernen.
+
+``pattern_completeness`` im Report misst das Ergebnis. Der Spalt kommt dafuer
+im Aussenband ausschliesslich vom Ausstoesser; nur tief innen, wo das Gyroid
+blosse Struktur ist, teilen sich beide.
+
 Der Spalt entsteht durch EROSION, nicht durch eine Niveaumenge
 ---------------------------------------------------------------
 Beide Koerper sind erodierte Haelften von phi. Das ist exakt und nicht nur
@@ -119,10 +145,11 @@ Reparatur, jede ihren Preis im Report -- das ist das Mass fuer die
                          Verbindungen aus.
 - ``resolve_diagonal_contacts``: Voxel, die sich nur ueber eine KANTE
                          beruehren, sind kein Verbund, sondern ein Scharnier
-                         mit Querschnitt null -- und im Mesh eine Kante mit
-                         vier statt zwei Dreiecken, an der jede
-                         Boolean-Operation scheitert. Erst fuellen, sonst
-                         trennen.
+                         mit Querschnitt null. Erst fuellen, sonst trennen.
+                         Was uebrigbleibt, loest ``voxels_to_mesh`` beim
+                         Vernetzen auf, indem es die geteilte Ecke
+                         aufspaltet -- eine Darstellungsfrage kostet so kein
+                         Material.
 - ``drop_specks`` / ``drop_unreachable``: was zu klein oder nicht anbindbar
                          ist, wird entfernt statt als loses Teil exportiert
                          -- und gemeldet.
@@ -255,7 +282,8 @@ def _wrap_max_theta(mask: np.ndarray, half_width: int) -> np.ndarray:
     )
 
 
-def dilate_xy(mask: np.ndarray, mm: float, grid: CylGrid) -> np.ndarray:
+def dilate_xy(mask: np.ndarray, mm: float, grid: CylGrid,
+              solid: bool = True) -> np.ndarray:
     """Dilatation um ``mm`` in der XY-EBENE (theta und r), NICHT in z.
 
     Das ist die Operation hinter der Bewegungsfreiheit: der Ausstoesser sitzt
@@ -277,7 +305,7 @@ def dilate_xy(mask: np.ndarray, mm: float, grid: CylGrid) -> np.ndarray:
         return np.asarray(mask, dtype=bool).copy()
     mask = np.asarray(mask, dtype=bool)
     r = grid.r_centers()
-    kmax = int(np.ceil(mm / grid.dr)) + 1
+    kmax = int(np.ceil(mm / grid.dr)) + (1 if solid else 0)
     out = np.zeros_like(mask)
     ring = np.arange(grid.nr)
     for k in range(-kmax, kmax + 1):
@@ -304,14 +332,25 @@ def dilate_xy(mask: np.ndarray, mm: float, grid: CylGrid) -> np.ndarray:
         # Also: Radien um je eine halbe Zelle aufeinander zu ruecken (die
         # einander zugewandten Kanten), und die Winkelbreite um eine ganze
         # Zelle aufweiten (je eine halbe Zelle Breite auf beiden Seiten).
-        lo = np.minimum(r1, r2) + grid.dr / 2.0
-        hi = np.maximum(r1, r2) - grid.dr / 2.0
+        #
+        # ``solid=False`` schaltet diesen Zuschlag ab und misst von Mitte zu
+        # Mitte. Das ist fuer den Bewegungsspalt falsch, fuer eine reine
+        # Groessenmessung aber richtig: mit dem Zuschlag frisst eine Erosion
+        # um 0.6 mm bei 0.9 mm Zellen jede Wand von Mindeststaerke auf, und
+        # die Gyroid-Anpassung verwirft daraufhin jede feine Masche als
+        # "zu duenn" (gemessen: Wandanteil 0.0 fuer alle Perioden unter
+        # 25 mm, obwohl die Waende in Wirklichkeit 1.2 mm dick waren).
+        margin = grid.dr / 2.0 if solid else 0.0
+        lo = np.minimum(r1, r2) + margin
+        hi = np.maximum(r1, r2) - margin
         lo = np.minimum(lo, hi)
         with np.errstate(invalid="ignore", divide="ignore"):
             cos_max = (lo ** 2 + hi ** 2 - mm ** 2) / (2 * lo * hi)
         cos_max = np.clip(cos_max, -1.0, 1.0)
         dtheta_max = np.arccos(cos_max)
-        half = np.ceil(dtheta_max / grid.dtheta - 1e-9).astype(int) + 1
+        half = np.ceil(dtheta_max / grid.dtheta - 1e-9).astype(int)
+        if solid:
+            half = half + 1
         half = np.where(hi - lo > mm + 1e-9, -1, half)
         half = np.minimum(half, grid.nt // 2)
         for width in np.unique(half):
@@ -412,7 +451,7 @@ def min_thickness_ok(mask: np.ndarray, mm: float, grid: CylGrid) -> float:
     Struktur ist wirklich dicker als ``mm``"."""
     if not mask.any():
         return 0.0
-    eroded = ~dilate_xy(~mask, mm / 2.0, grid)
+    eroded = ~dilate_xy(~mask, mm / 2.0, grid, solid=False)
     return float(eroded.sum()) / float(mask.sum())
 
 
@@ -472,6 +511,33 @@ def count_components(mask: np.ndarray) -> int:
 # ---------------------------------------------------------------------------
 # 4. Grundprinzip 1: 45deg-Projektion nach innen
 # ---------------------------------------------------------------------------
+
+def to_ray(field: np.ndarray, grid: CylGrid) -> np.ndarray:
+    """Feld (t, z, r) -> Strahlkoordinaten (t, z0, k).
+
+    k = 0 ist die Mantelzelle, k waechst nach innen; z0 ist die Bildzeile,
+    aus der der Strahl stammt. Weil ein Schritt nach innen genau ein Schritt
+    nach unten ist, laeuft ein 45deg-Strahl in dieser Darstellung gerade --
+    alles, was entlang eines Strahls zu entscheiden ist, wird damit zu einer
+    gewoehnlichen Achsenoperation.
+    """
+    nt, nz, nr = grid.shape
+    out = np.zeros((nt, nz, nr), dtype=bool)
+    for k in range(nr):
+        if k < nz:
+            out[:, k:, k] = field[:, :nz - k, nr - 1 - k]
+    return out
+
+
+def from_ray(ray: np.ndarray, grid: CylGrid) -> np.ndarray:
+    """Umkehrung von ``to_ray``."""
+    nt, nz, nr = grid.shape
+    out = np.zeros((nt, nz, nr), dtype=bool)
+    for k in range(nr):
+        if k < nz:
+            out[:, :nz - k, nr - 1 - k] = ray[:, k:, k]
+    return out
+
 
 def project_45(mask2d: np.ndarray, grid: CylGrid,
                from_depth_mm: float, to_depth_mm: float,
@@ -558,13 +624,17 @@ class GyroidFit:
 
 
 def gyroid_halves(grid: CylGrid, zone: np.ndarray, fit: GyroidFit,
-                  erosion_mm: float) -> tuple[np.ndarray, np.ndarray]:
+                  clearance_mm: float) -> tuple[np.ndarray, np.ndarray]:
     """Die beiden Gyroid-Haelften, so wie sie spaeter wirklich gebaut werden:
-    Trennflaeche bei g = 0, Spalt durch beidseitige Erosion."""
+    Trennflaeche bei g = 0, und der GANZE Spalt aus der Ausstoesserhaelfte
+    herausgeschnitten. Die Klingenhaelfte bleibt ungekuerzt -- so wie in
+    ``split_bodies``, damit die Anpassung dieselbe Struktur bewertet, die
+    hinterher gebaut wird."""
     g = gyroid_field(grid, fit.period_mm, fit.phase, fit.z_stretch)
     side = g >= 0
-    a = side & ~dilate_xy(~side, erosion_mm, grid) & zone
-    b = ~side & ~dilate_xy(side, erosion_mm, grid) & zone
+    shave = clearance_mm / 2.0 + grid.voxel_mm / 2.0
+    a = side & ~dilate_xy(~side, shave, grid, solid=False) & zone
+    b = ~dilate_xy(a, clearance_mm, grid) & zone
     return a, b
 
 
@@ -579,31 +649,31 @@ def _phase_list(n: int) -> list[tuple[float, float, float]]:
             for i in range(n)]
 
 
-def fit_gyroid(grid: CylGrid, zone: np.ndarray, erosion_mm: float,
+def fit_gyroid(grid: CylGrid, zone: np.ndarray, clearance_mm: float,
                min_wall_mm: float, periods_mm: list[float],
                z_stretches: list[float] | None = None, n_phases: int = 4,
                anchor_a: np.ndarray | None = None,
-               anchor_b: np.ndarray | None = None) -> GyroidFit:
+               anchor_b: np.ndarray | None = None,
+               max_fragments: int = 16,
+               min_wall_ratio: float = 0.35) -> GyroidFit:
     """Sucht Periode, z-Streckung und Phase des Gyroids.
 
     Bewertet wird an der Struktur, die spaeter TATSAECHLICH gebaut wird --
-    also an den um den halben Hub erodierten Haelften, nicht an einer
-    Niveaumenge ``|g| > t``. Das ist keine Formalie: die erodierte Haelfte
-    zerfaellt bei einer anderen Periode als die Niveaumenge, und eine
-    Anpassung, die etwas anderes bewertet als sie baut, sucht das Optimum
-    fuer die falsche Struktur.
+    an den fertig freigeschnittenen Haelften, nicht an einer Niveaumenge.
+    Das ist keine Formalie: die freigeschnittene Haelfte zerfaellt bei einer
+    ganz anderen Periode als die Niveaumenge, und eine Anpassung, die etwas
+    anderes bewertet als sie baut, sucht das Optimum fuer die falsche
+    Struktur.
 
-    Kriterien, in dieser Reihenfolge:
-
-    1. beide Haelften bleiben ZUSAMMEN MIT der Massivzone je ein Koerper --
-       das ist der eigentliche Zweck des Gyroids,
-    2. moeglichst wenig schwebendes Material,
-    3. Wandstaerke.
-
-    Die Periode waechst aufsteigend nur so weit, wie es dafuer noetig ist:
-    ein feines Gyroid bietet dem Muster mehr Anbindungspunkte. Untergrenze
-    ist der Hub selbst -- eine Masche, die schmaler ist als die beidseitige
-    Erosion, verschwindet beim Erodieren vollstaendig.
+    Gewaehlt wird die FEINSTE Masche, die noch brauchbar ist -- nicht die
+    "beste". Fein ist der eigentliche Zweck: je kleiner die Masche, desto
+    mehr Anbindungspunkte findet jedes Musterdetail in der Tiefe und desto
+    kuerzer sind die Saeulen, mit denen es dorthin reicht. Brauchbar heisst:
+    beide Haelften bleiben zusammen mit der Massivzone in hoechstens
+    ``max_fragments`` Stuecken (den Rest naeht die Verbindungsreparatur
+    zusammen) und ihr Material ist ueberwiegend dicker als die
+    Mindestwandstaerke. Weil die Perioden aufsteigend probiert werden, ist die
+    erste brauchbare auch die feinste; danach wird abgebrochen.
 
     Warum die z-Streckung mitgesucht wird: ein isotropes Gyroid hat in jeder
     Masche ein lokales z-Minimum, und jedes davon faengt beim Drucken in der
@@ -617,10 +687,11 @@ def fit_gyroid(grid: CylGrid, zone: np.ndarray, erosion_mm: float,
     best: GyroidFit | None = None
     best_key = None
     for period in periods_mm:
+        usable_here = False
         for zs in z_stretches:
             for phase in _phase_list(n_phases):
                 cand = GyroidFit(period, phase, zs)
-                a, b = gyroid_halves(grid, zone, cand, erosion_mm)
+                a, b = gyroid_halves(grid, zone, cand, clearance_mm)
                 if not a.any() or not b.any():
                     continue
                 wa = min_thickness_ok(a, min_wall_mm, grid)
@@ -631,15 +702,21 @@ def fit_gyroid(grid: CylGrid, zone: np.ndarray, erosion_mm: float,
                 floating = check_floating(a, grid) + check_floating(b, grid)
                 cand.wall_ratio_a, cand.wall_ratio_b = wa, wb
                 cand.fragments, cand.floating = frag, floating
+                usable = (frag <= max_fragments
+                          and min(wa, wb) >= min_wall_ratio)
                 tried.append({"period_mm": period, "z_stretch": zs,
                               "phase": [round(float(p), 2) for p in phase],
                               "fragments": frag, "floating": floating,
-                              "wall_ratio": (round(wa, 2), round(wb, 2))})
-                key = (frag, floating, -min(wa, wb))
+                              "wall_ratio": (round(wa, 2), round(wb, 2)),
+                              "usable": usable})
+                usable_here = usable_here or usable
+                # Brauchbar schlaegt unbrauchbar; darunter zaehlt die feinste
+                # Masche, dann wenig schwebendes Material, dann Wandstaerke.
+                key = (not usable, period, floating, -min(wa, wb))
                 if best_key is None or key < best_key:
                     best_key, best = key, cand
-        if best_key is not None and best_key[0] <= 2 and -best_key[2] > 0.5:
-            break   # zusammenhaengend und dickwandig -- groeber muss es nicht
+        if usable_here:
+            break
     if best is None:
         best = GyroidFit(periods_mm[-1], (0.0, 0.0, 0.0),
                          (z_stretches or [1.0])[0])
@@ -766,18 +843,27 @@ def _lateral_reach(occ: np.ndarray, grid: CylGrid,
 
 
 def trim_floating(occ: np.ndarray, grid: CylGrid,
-                  max_overhang_deg: float = 45.0
+                  max_overhang_deg: float = 45.0,
+                  protect: np.ndarray | None = None
                   ) -> tuple[np.ndarray, np.ndarray]:
     """Alles entfernen, was keine Auflage hat -- und was dadurch seinerseits
     die Auflage verliert, gleich mit.
 
     Nur LOESCHEN, nie setzen: dadurch schrumpft die Belegung monoton, das
     Verfahren terminiert garantiert, und am Ende schwebt nichts mehr.
+
+    ``protect`` ist davon ausgenommen. Dort steht das Muster, und das ist das
+    Produkt: es wegzutrimmen loest zwar formal die Ueberhangbedingung, liefert
+    aber ein Werkzeug, das nicht mehr das schneidet, was der Benutzer
+    hochgeladen hat -- gemessen am Puzzlebild waren das 41.6 % der
+    Klingenpixel. Bleibt danach geschuetztes Material ohne Auflage stehen,
+    wird das gezaehlt und gemeldet statt stillschweigend behoben.
     """
     occ = occ.copy()
     removed = np.zeros(grid.shape, dtype=bool)
+    keep = protect if protect is not None else np.zeros_like(occ)
     for _ in range(grid.nz + 2):
-        floating = occ & ~support_map(occ, grid, max_overhang_deg)
+        floating = occ & ~support_map(occ, grid, max_overhang_deg) & ~keep
         if not floating.any():
             break
         occ &= ~floating
@@ -787,7 +873,9 @@ def trim_floating(occ: np.ndarray, grid: CylGrid,
 
 def repair_support(occ: np.ndarray, allowed: np.ndarray, grid: CylGrid,
                    max_overhang_deg: float = 45.0,
-                   max_pillar_layers: int = 60) -> tuple[np.ndarray, dict]:
+                   max_pillar_layers: int = 60,
+                   protect: np.ndarray | None = None
+                   ) -> tuple[np.ndarray, dict]:
     """Kein Voxel schwebt.
 
     Schicht fuer Schicht von unten nach oben: hat ein Voxel keine Auflage im
@@ -813,6 +901,7 @@ def repair_support(occ: np.ndarray, allowed: np.ndarray, grid: CylGrid,
     """
     occ = occ.copy()
     dead = np.zeros(grid.shape, dtype=bool)
+    keep = protect if protect is not None else np.zeros_like(occ)
     added = removed = 0
     offsets = [(0, 0), (0, -1), (0, 1), (-1, 0), (1, 0), (-1, -1), (1, -1),
                (-1, 1), (1, 1)]
@@ -825,6 +914,9 @@ def repair_support(occ: np.ndarray, allowed: np.ndarray, grid: CylGrid,
         Hin und Her, das ein Loeschen mitten im Aufbau ausgeloest hat."""
         nonlocal removed
         while fail.any():
+            fail = fail & ~keep[:, level, :]     # Muster bleibt stehen
+            if not fail.any():
+                return
             if not chain or chain[-1][0] != level:
                 dead[:, level, :] |= fail
                 return
@@ -881,7 +973,7 @@ def repair_support(occ: np.ndarray, allowed: np.ndarray, grid: CylGrid,
                 rollback(need & occ[:, level, :], level, chain)
 
     # -- Trimmen: was jetzt noch schwebt, faellt weg -----------------------
-    occ, trimmed_mask = trim_floating(occ, grid, max_overhang_deg)
+    occ, trimmed_mask = trim_floating(occ, grid, max_overhang_deg, keep)
     trimmed = int(trimmed_mask.sum())
     removed += trimmed
     return occ, {"support_voxels_added": added,
@@ -1152,7 +1244,9 @@ def resolve_diagonal_contacts(occ: np.ndarray, allowed: np.ndarray,
                     continue
                 drop |= _scatter_axes(rest & ~p2, ax2)
                 drop |= _scatter_axes(rest & p2 & ~p1, ax1)
-                drop |= _scatter_axes(rest & p2 & p1, ax2)   # beide Muster
+                # Sind BEIDE Partner Muster, bleibt der Kontakt lieber stehen:
+                # ein Loch im Muster waere schlimmer als eine Kante, die im
+                # Mesh vierfach benutzt ist. Gezaehlt wird er trotzdem.
         add &= allowed & ~occ
         drop &= occ & ~add
         if not add.any() and not drop.any():
@@ -1207,8 +1301,8 @@ def _shift_pos(a: np.ndarray, axis: int) -> np.ndarray:
     return out
 
 
-def drop_specks(occ: np.ndarray, grid: CylGrid, min_fragment_mm: float
-                ) -> tuple[np.ndarray, dict]:
+def drop_specks(occ: np.ndarray, grid: CylGrid, min_fragment_mm: float,
+                protect: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
     """Fragmente entfernen, die kleiner sind als das kleinste sinnvolle
     Detail.
 
@@ -1233,6 +1327,8 @@ def drop_specks(occ: np.ndarray, grid: CylGrid, min_fragment_mm: float
     sizes[0] = 0
     keep = sizes >= min_voxels
     keep[int(np.argmax(sizes))] = True
+    if protect is not None:
+        keep[np.unique(labels[protect & occ])] = True
     keep[0] = False
     drop = ~keep[labels] & occ
     removed = int(drop.sum())
@@ -1330,8 +1426,8 @@ def finalize_body(occ: np.ndarray, allowed: np.ndarray, protect: np.ndarray,
         occ, diag = resolve_diagonal_contacts(occ, allowed, protect, grid,
                                               cfg.max_overhang_deg,
                                               require_support=attempt < 2)
-        occ, trimmed = trim_floating(occ, grid, cfg.max_overhang_deg)
-        occ, spk = drop_specks(occ, grid, cfg.min_fragment_mm())
+        occ, trimmed = trim_floating(occ, grid, cfg.max_overhang_deg, protect)
+        occ, spk = drop_specks(occ, grid, cfg.min_fragment_mm(), protect)
         occ, loose = drop_unreachable(occ, protect, grid,
                                       cfg.droppable_fragment_mm3)
         info["diagonal_contacts_closed"] += diag["diagonal_contacts_closed"]
@@ -1348,7 +1444,8 @@ def finalize_body(occ: np.ndarray, allowed: np.ndarray, protect: np.ndarray,
 
 
 def repair_body(occ: np.ndarray, allowed: np.ndarray, protect: np.ndarray,
-                grid: CylGrid, cfg: "CoexistenceConfig") -> tuple[np.ndarray, dict]:
+                grid: CylGrid, cfg: "CoexistenceConfig",
+                restore: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
     """Alle Reparaturen eines Koerpers, bis sie sich nicht mehr gegenseitig
     aufheben.
 
@@ -1364,7 +1461,7 @@ def repair_body(occ: np.ndarray, allowed: np.ndarray, protect: np.ndarray,
     ``max_repair_rounds`` Runden nicht erreicht, steht der erreichte Zustand
     im Report -- mit Zahlen, nicht mit einem Achselzucken.
     """
-    occ, info = drop_specks(occ, grid, cfg.min_fragment_mm())
+    occ, info = drop_specks(occ, grid, cfg.min_fragment_mm(), protect)
     # Zellen, an denen eine Stuetze schon einmal gescheitert ist, bleiben
     # gesperrt. Sonst waehlt die Verbindungssuche in der naechsten Runde
     # denselben kuerzesten Weg, die Stuetzreparatur schneidet ihn genauso
@@ -1379,7 +1476,7 @@ def repair_body(occ: np.ndarray, allowed: np.ndarray, protect: np.ndarray,
                     "pattern_volume_dropped_mm3": 0.0}
     for round_no in range(1, cfg.max_repair_rounds + 1):
         occ, sup = repair_support(occ, allowed & ~blocked, grid,
-                                  cfg.max_overhang_deg)
+                                  cfg.max_overhang_deg, protect=protect)
         blocked |= sup.pop("trimmed_mask")
         occ, fin = finalize_body(occ, allowed & ~blocked, protect, grid, cfg)
         link_space = (allowed & ~blocked
@@ -1387,7 +1484,7 @@ def repair_body(occ: np.ndarray, allowed: np.ndarray, protect: np.ndarray,
                                          cfg.max_overhang_deg))
         occ, con = repair_connectivity(occ, link_space, grid, cfg.max_link_steps)
         occ, sup2 = repair_support(occ, allowed & ~blocked, grid,
-                                   cfg.max_overhang_deg)
+                                   cfg.max_overhang_deg, protect=protect)
         blocked |= sup2.pop("trimmed_mask")
         occ, fin2 = finalize_body(occ, allowed & ~blocked, protect, grid, cfg)
 
@@ -1423,7 +1520,8 @@ def repair_body(occ: np.ndarray, allowed: np.ndarray, protect: np.ndarray,
     def settle(state: np.ndarray) -> np.ndarray:
         for _ in range(30):
             before = state.copy()
-            state, trimmed = trim_floating(state, grid, cfg.max_overhang_deg)
+            state, trimmed = trim_floating(state, grid, cfg.max_overhang_deg,
+                                           protect)
             state, diag = resolve_diagonal_contacts(
                 state, allowed, protect, grid, cfg.max_overhang_deg,
                 separate_only=True)
@@ -1431,7 +1529,7 @@ def repair_body(occ: np.ndarray, allowed: np.ndarray, protect: np.ndarray,
             totals["diagonal_contacts_separated"] += diag["diagonal_contacts_separated"]
             if np.array_equal(state, before):
                 break
-        state, spk = drop_specks(state, grid, cfg.min_fragment_mm())
+        state, spk = drop_specks(state, grid, cfg.min_fragment_mm(), protect)
         state, loose = drop_unreachable(state, protect, grid,
                                         cfg.droppable_fragment_mm3)
         totals["specks_removed"] += spk["specks_removed"]
@@ -1441,6 +1539,29 @@ def repair_body(occ: np.ndarray, allowed: np.ndarray, protect: np.ndarray,
         return state
 
     occ = settle(occ)
+
+    # Geschuetztes Material, dem eine Reparatur die Auflage weggenommen hat,
+    # bekommt eine senkrechte Stuetze bis nach unten -- durch erlaubten
+    # Freiraum, also ohne den Bewegungsspalt anzutasten. Loeschen waere hier
+    # die falsche Antwort: geschuetzt ist, was das Muster traegt.
+    # Was das Muster traegt und unterwegs weggeraeumt wurde, kommt zurueck --
+    # aber nur, wo der Bewegungsspalt es zulaesst.
+    if restore is not None:
+        back = restore & ~occ & allowed
+        if back.any():
+            occ |= back
+            totals["support_voxels_added"] += int(back.sum())
+            occ = settle(occ)
+
+    stranded = occ & ~support_map(occ, grid, cfg.max_overhang_deg) & protect
+    if stranded.any():
+        pillar = np.flip(np.maximum.accumulate(np.flip(stranded, axis=1),
+                                               axis=1), axis=1)
+        pillar &= allowed & ~occ
+        occ |= pillar
+        totals["support_voxels_added"] += int(pillar.sum())
+        occ = settle(occ)
+
     # Das Wegnehmen kann eine Verbindung gekappt haben. Also noch einmal
     # verbinden und noch einmal abraeumen -- und am Ende den Zustand
     # behalten, der am wenigsten Teile hat. Besser ein paar Voxel weniger als
@@ -1456,7 +1577,7 @@ def repair_body(occ: np.ndarray, allowed: np.ndarray, protect: np.ndarray,
         candidate, con = repair_connectivity(best, link_space, grid,
                                              cfg.max_link_steps)
         candidate, sup = repair_support(candidate, allowed & ~blocked, grid,
-                                        cfg.max_overhang_deg)
+                                        cfg.max_overhang_deg, protect=protect)
         sup.pop("trimmed_mask", None)
         candidate = settle(candidate)
         components = count_components(candidate)
@@ -1487,7 +1608,7 @@ class CoexistenceConfig:
     voxel_mm: float = 0.8
     #: Schneidentiefe: so tief steht die Klinge ueber dem Ausstoesser.
     cut_depth_mm: float = 4.0
-    #: Auswerferhub = geforderter Freiraum zwischen den Koerpern in X&Y.
+    #: Auswerferhub: der volle Weg, den eine Platte zurueckleget.
     travel_mm: float = 3.0
     #: Druckspiel; wirkt zusaetzlich in ALLE Richtungen (auch z).
     print_clearance_mm: float = 0.4
@@ -1521,30 +1642,40 @@ class CoexistenceConfig:
     #: None = doppelte Mindestwandstaerke.
     min_fragment_mm_value: float | None = None
 
+    def clearance_mm(self) -> float:
+        """Der Freiraum, der zwischen beiden Koerpern bleiben muss.
+
+        Das ist die HALBE Hubstrecke, nicht die ganze: der Ausstoesser sitzt
+        exzentrisch, seine Mittellage ist die Ruhelage, und er wandert daraus
+        um +-travel/2. Bei 3 mm Hub sind also 1.5 mm Spalt gefordert.
+
+        Der Unterschied ist nicht kosmetisch. Mit dem doppelten Wert muss das
+        Gyroid so grob werden, dass es dem Muster kaum noch Anbindungspunkte
+        bietet -- und was sich nicht anbinden laesst, faellt weg: gemessen
+        fehlten am Puzzlemuster 41.6 % der Klingenpixel im fertigen Koerper.
+        """
+        return self.travel_mm / 2.0
+
     def min_radius_mm(self) -> float:
         """Kleinster Radius, bei dem der Aufbau ueberhaupt Platz hat.
 
-        Von aussen nach innen aufaddiert, jeder Posten unverzichtbar:
+        Massgeblich ist die GYROID-ZONE zwischen Nabe und Schneidentiefe:
+        dort verbinden sich die eingeschlossenen Musterflaechen. Sie muss ein
+        paar Maschen dick sein, sonst zerfaellt das Netzwerk darin in Ringe
+        und der Ausstoesser kommt in mehreren Teilen heraus.
 
-            Schneidentiefe + Ueberblendstrecke   das Muster und sein Uebergang
-          + 2 * Mindestwandstaerke + Hub         eine Gyroid-Masche: zwei
-                                                 Waende und der Spalt dazwischen
-          + Hub + Druckspiel                     Abstand der Klinge zur Nabe
-          + Nabenradius                          Nabe samt Achsbohrung
+            Radius >= Schneidentiefe + Nabenradius + 4 * Maschenmass
 
-        Darunter bleibt fuer die Gyroid-Zone weniger als eine Masche uebrig.
-        Die Koerper kommen dann zwar immer noch heraus, aber die
-        eingeschlossenen Musterflaechen finden in der Tiefe keinen Weg mehr
-        zueinander: gemessen an einem Puzzlemuster mit Radius 20 mm mussten
-        633 mm3 Musterflaeche entfallen, weil sie ringsum vom Bewegungsspalt
-        eingeschlossen waren. Das ist keine Frage der Aufloesung, sondern des
-        Platzes -- deshalb wird es gesperrt statt hinterher gemeldet.
+        Das Maschenmass ist die feinstmoegliche Masche: Spalt + zwei Waende,
+        zuzueglich der halben Voxelkante, die der Ausstoesser als Reserve
+        traegt. Der Faktor 4 ist gemessen und nicht geraten -- die feinste
+        brauchbare Periode liegt bei rund zwei Maschenmassen, und die Zone
+        muss knapp zwei Perioden fassen. Unterhalb davon kam der Ausstoesser
+        in zwei bis fuenf Teilen heraus.
         """
-        gyroid_zone = 2.0 * self.min_wall_mm + self.travel_mm
-        return (self.cut_depth_mm + self.blend_mm
-                + gyroid_zone
-                + self.travel_mm + self.print_clearance_mm
-                + self.hub_radius())
+        cell = (self.clearance_mm() + self.voxel_mm / 2.0
+                + 2.0 * self.min_wall_mm)
+        return self.cut_depth_mm + self.hub_radius() + 4.0 * cell
 
     def min_fragment_mm(self) -> float:
         if self.min_fragment_mm_value is not None:
@@ -1666,117 +1797,145 @@ def allegiance_field(blade2d: np.ndarray, grid: CylGrid, fit: GyroidFit,
     return np.minimum(phi, hub_field[None, None, :])
 
 
+def enforce_blade_continuity(side: np.ndarray, blade2d: np.ndarray,
+                             grid: CylGrid, deep_start_mm: float,
+                             min_radius_mm: float
+                             ) -> tuple[np.ndarray, dict]:
+    """Jede Klingenlinie bekommt eine durchgehende Verbindung von der
+    Mantelflaeche bis zu ihrem eigenen Gyroid-Netzwerk.
+
+    Ohne das ist die Vollstaendigkeit des Musters nicht zu halten: die
+    Ueberblendung entscheidet tief unten allein nach dem Gyroid, und wo
+    dieses unter einer Klingenlinie "Ausstoesser" sagt, reisst die
+    45deg-Treppe ab. Alles darueber steht dann in der Luft, die
+    Stuetzreparatur trimmt es weg -- und mit ihm das Muster. Gemessen am
+    Puzzlebild fehlten so 41.6 % der Klingenpixel im fertigen Koerper, bei
+    11156 weggetrimmten Voxeln.
+
+    Gefuellt wird entlang des 45deg-Strahls, und nur so weit, wie noetig: bis
+    zum ersten Punkt, an dem der Strahl ohnehin schon zur Klinge gehoert und
+    tief genug fuer das Gyroid ist. Ab dort traegt das Netzwerk. Was sein
+    Netzwerk gar nicht trifft, laeuft bis an die Nabe durch.
+    """
+    nt, nz, nr = grid.shape
+    depth_of_k = grid.depth_centers()[::-1]
+    r_of_k = grid.r_centers()[::-1]
+    k_idx = np.arange(nr)
+
+    deep = depth_of_k >= deep_start_mm
+    anchored = to_ray(side, grid) & deep[None, None, :]
+    has = anchored.any(axis=2)
+    first = np.argmax(anchored, axis=2)
+    last = np.where(has, first, nr - 1)
+
+    reach = (k_idx[None, None, :] <= last[:, :, None])
+    reach &= (r_of_k >= min_radius_mm - 1e-9)[None, None, :]
+    filled = from_ray(blade2d[:, :, None] & reach, grid)
+    added = int((filled & ~side).sum())
+    return side | filled, {"added": added, "columns": filled}
+
+
 def split_bodies(blade2d: np.ndarray, grid: CylGrid, fit: GyroidFit,
                  cfg: CoexistenceConfig) -> tuple[np.ndarray, np.ndarray, dict]:
     """Aus der Trennflaeche werden zwei Koerper mit garantiertem Spalt.
 
-    Der Spalt entsteht durch EROSION der beiden Haelften, nicht durch eine
-    Niveaumenge. Das ist exakt und nicht nur naeherungsweise: liegt ein Punkt
-    x in der erodierten Schneide und ein Punkt y im erodierten Ausstoesser,
-    dann kreuzt die Verbindungsstrecke die Trennflaeche in einem Punkt p, und
-    es gilt ``d(x,y) = d(x,p) + d(p,y) >= e_Schneide + e_Ausstoesser``. Die
-    Summe der beiden Erosionen IST der Spalt -- ohne Bisektion, ohne
-    Gradientenabschaetzung, ohne Sicherheitsaufschlag.
+    Zwei Dinge sind hier verschieden wichtig. Das MUSTER ist das Produkt: es
+    muss vollstaendig im Bauteil landen, also wird an der Klinge im
+    Aussenband und an ihren Verbindungssaeulen nach innen nichts
+    weggenommen. Was tief innen vom Gyroid uebrigbleibt, ist dagegen blosse
+    Struktur -- dort duerfen sich beide Koerper den Spalt teilen. Genau diese
+    Unterscheidung macht ein feines Gyroid moeglich: traegt der Ausstoesser
+    den Spalt ueberall allein, muss die Masche so gross werden, dass seine
+    Kanaele die Erosion ueberstehen (gemessen 25 mm Periode und nur 41 % des
+    Materials dicker als die Mindestwandstaerke).
 
-    Aufgeteilt wird die Summe tiefenabhaengig, weil beide Koerper sehr
-    unterschiedlich viel abgeben koennen:
+    Der Ausstoesser ist danach nicht die Gegenseite der Trennflaeche, sondern
+    schlicht ALLES, was weit genug von der fertigen Klinge entfernt ist. Damit
+    faellt ihm jeder Millimeter zu, den die Klinge tief innen abgibt, und der
+    Spalt ist trotzdem exakt: er ist als Abstand zum fertigen Koerper
+    definiert, nicht als Nebenprodukt zweier Erosionen.
 
-    - Im Aussenband ist die Klinge oft nur ein bis zwei Millimeter breit. Sie
-      kann gar nichts abgeben, sonst verschwindet das Muster; dort traegt der
-      Ausstoesser den ganzen Hub. Genau das ist die uebliche
-      Auswerfer-Geometrie: die Platte sitzt ringsum ``travel`` von der Klinge
-      entfernt.
-    - Tief im Bauteil sind beide Strukturen gleich dick; dort teilen sie sich
-      den Hub haelftig, was beiden Wandstaerke laesst.
-
-    Damit die Summe auch am Uebergang stimmt, wird die Erosion des
-    Ausstoessers erst ``travel`` TIEFER umgeschaltet als die der Schneide:
-    zwei Punkte im Abstand des Hubs liegen hoechstens ``travel`` in der Tiefe
-    auseinander, und so ist in jeder Kombination die Summe >= travel.
+    Gefordert ist die halbe Hubstrecke: der Ausstoesser sitzt exzentrisch und
+    wandert aus seiner Mittellage um +-travel/2.
     """
     phi = allegiance_field(blade2d, grid, fit, cfg)
     depth = grid.depth_centers()
-    travel = cfg.travel_mm
-    half = travel / 2.0
+    clearance = cfg.clearance_mm()
+    deep_start = cfg.cut_depth_mm + cfg.blend_mm
+
     side = phi >= 0
 
-    # Erosionsprofil ueber der Tiefe. e_b waechst monoton von 0 (Aussenband:
-    # die Klinge ist dort oft nur ein bis zwei Millimeter breit und kann
-    # nichts abgeben) auf den halben Hub (tief innen sind beide Strukturen
-    # gleich dick und teilen sich den Hub). e_e ist der Rest -- ausgewertet
-    # eine Hubtiefe WEITER INNEN, denn zwei Punkte, die sich beim Verschieben
-    # um den Hub beruehren koennten, liegen hoechstens ``travel`` in der Tiefe
-    # auseinander. Weil e_b monoton waechst, gilt damit in jeder Kombination
-    #     e_b(d1) + e_e(d2) >= e_b(d1) + travel - e_b(d2 + travel) >= travel.
+    # Das Aussenband ist immer unantastbar -- dort steht das Muster.
+    outer = np.zeros(grid.shape, dtype=bool)
+    outer[:, :, depth < cfg.cut_depth_mm] = True
+
+    # ZUERST schneiden, DANN die Verbindung suchen. Andersherum enden die
+    # Saeulen auf Material, das die Erosion gleich darauf wieder wegnimmt --
+    # sie haengen dann in der Luft und werden als lose Fragmente entsorgt
+    # (gemessen 468 Stueck mit 395 mm3, und 135 schwebende Voxel).
     #
-    # Ein SPRUNG statt einer Rampe war hier ein echter Fehler: er legte die
-    # volle 3-mm-Erosion des Ausstoessers genau in die Ueberblendzone, wo die
-    # Platten in das Gyroid uebergehen -- die Uebergaenge schnuerten ab, und
-    # der Ausstoesser zerfiel in 46 Teile statt in eines.
-    # Die Rampe beginnt ERST UNTERHALB der Ueberblendzone. Darueber leben die
-    # 45deg-Treppen des Musters, und eine Erosion nimmt ihnen von unten die
-    # Auflage: das Muster steht danach in der Luft, die Stuetzreparatur trimmt
-    # es weg (gemessen: 1199 schwebende Voxel in Tiefe 5 mm, daraus 15108
-    # getrimmte und ein in 240 Teile zerfallener Koerper), und
-    # nachwachsen kann es dort auch nicht -- der Erosionssaum ist ja gerade
-    # der Streifen, der dem Ausstoesser gehoert. Tiefer unten steht statt der
-    # Treppe das Gyroid, und dessen erodierte Haelften sind bei der Anpassung
-    # bereits auf Stuetzfreiheit geprueft.
-    def ramp(d: np.ndarray) -> np.ndarray:
-        start = cfg.cut_depth_mm + cfg.blend_mm
-        t = np.clip((d - start) / max(cfg.blend_mm, 1e-6), 0.0, 1.0)
-        return half * t
+    # Der Schnittbetrag ist nicht die halbe Spaltbreite, sondern die halbe
+    # Spaltbreite PLUS eine halbe Zelle: der Ausstoesser wird mit der
+    # konservativen Flaeche-zu-Flaeche-Metrik freigeschnitten und zahlt
+    # dadurch einen Zuschlag von rund einer Voxelkante, den die Klinge mit
+    # ihrer Mittelpunkt-Erosion nicht zahlt. Traegt er ihn allein, bleibt bei
+    # feiner Masche nichts von ihm uebrig (gemessen 2.8 % Volumen gegenueber
+    # 21 % fuer die Klinge bei 7.8 mm Periode). Mit dem Ausgleich sind beide
+    # Haelften etwa gleich dick, und die Masche darf halb so gross werden.
+    shave_mm = clearance / 2.0 + grid.voxel_mm / 2.0
+    shave = side & ~outer & dilate_xy(~side, shave_mm, grid, solid=False)
+    blade = side & ~shave
 
-    levels = np.linspace(0.0, half, 4)
+    blade, continuity = enforce_blade_continuity(
+        blade, blade2d, grid, deep_start,
+        cfg.hub_radius() + clearance + cfg.print_clearance_mm)
 
-    def eroded(mask: np.ndarray, other: np.ndarray, amounts: np.ndarray
-               ) -> np.ndarray:
-        """Erosion mit tiefenabhaengigem Betrag: je Stufe einmal dilatieren,
-        dann pro Radiusring die passende Stufe auswaehlen (eine staerkere
-        Erosion ist immer in der schwaecheren enthalten)."""
-        out = np.zeros_like(mask)
-        uniq = np.unique(np.round(amounts, 6))
-        for amount in uniq:
-            sel = np.round(amounts, 6) == amount
-            if not sel.any():
-                continue
-            if amount <= 0:
-                out[:, :, sel] = mask[:, :, sel]
-            else:
-                keep = mask & ~dilate_xy(other, float(amount), grid)
-                out[:, :, sel] = keep[:, :, sel]
-        return out
+    # Wo eine Saeule ihr Netzwerk nicht mehr trifft, endet sie am
+    # Nabenabstand -- und ihre Spitze steht dort auf nichts. Radial kann sie
+    # nicht weiter (dahinter liegt der Bewegungsraum der Nabe), senkrecht
+    # aber schon: eine Stuetze bis zur Druckplatte. Das ist druckbar (0 Grad
+    # Ueberhang), verankert das Musterdetail zusaetzlich am Boden und kostet
+    # ein paar Voxel. Ohne sie bleiben genau diese Spitzen schwebend
+    # (gemessen 81 von 87 Faellen bei Tiefe 22 mm = Nabenabstand).
+    tips = (continuity["columns"] & blade
+            & ~support_map(blade, grid, cfg.max_overhang_deg))
+    pillars = np.flip(np.maximum.accumulate(np.flip(tips, axis=1), axis=1),
+                      axis=1)
+    blade |= pillars
 
-    e_blade = levels[np.abs(levels[None, :] - ramp(depth)[:, None]).argmin(axis=1)]
-    e_ej_raw = travel - ramp(depth + travel)
-    ej_levels = np.unique(np.concatenate([levels + half, [travel]]))
-    e_ej = ej_levels[np.abs(ej_levels[None, :] - e_ej_raw[:, None]).argmin(axis=1)]
-    e_ej = np.maximum(e_ej, e_ej_raw)      # nie weniger als noetig
+    # Unantastbar sind die MUSTERZELLEN im Aussenband -- nicht das ganze
+    # Band. Der Unterschied ist entscheidend: schuetzt man den Bereich statt
+    # des Materials, dann geniesst auch jede Zelle Schutz, die eine Reparatur
+    # spaeter dort hineinsetzt, und ein schwebender Verbindungssteg im Band
+    # laesst sich nie wieder entfernen (gemessen 95 solcher Voxel, alle in
+    # Tiefe 3 mm, keines davon Muster).
+    protect = blade & outer
 
-    blade = eroded(side, ~side, e_blade)
-    ejector = eroded(~side, side, e_ej)
-    # Druckspiel wirkt zusaetzlich in ALLE Richtungen, auch in z.
-    ejector &= ~dilate_3d(side, cfg.print_clearance_mm, grid)
+    # Der Ausstoesser haelt eine halbe Voxelkante MEHR Abstand als noetig. Ohne
+    # diese Reserve hat die Klinge nirgends Platz: der Spalt ist dann exakt
+    # so breit wie gefordert, jede Zelle neben der Klinge liegt naeher als
+    # der Spalt am Ausstoesser -- und damit kann die Stuetzreparatur kein
+    # einziges Voxel setzen und der Kantenschluss keine einzige Luecke
+    # fuellen. Uebrig bleiben schwebende Musterzellen und ein Mesh, das nicht
+    # schliesst. Eine Zelle Reserve kostet den Ausstoesser wenig und gibt
+    # jeder Nachbesserung an der Klinge den noetigen Spielraum.
+    ejector = (~dilate_xy(blade, clearance + grid.voxel_mm / 2.0, grid)
+               & ~dilate_3d(blade, cfg.print_clearance_mm, grid))
+    # Die Tasche vor dem Ausstoesser ist so tief wie die Schneide: dort sitzt
+    # das geschnittene Teil, und aus ihr drueckt die Platte es heraus.
+    ejector[:, :, depth < cfg.cut_depth_mm] = False
 
-    # Vor der Kavitaet steht nur die Klinge: der Hohlraum haelt den Teig, und
-    # seine Tiefe IST der Auswerferhub.
-    ejector[:, :, depth < travel] = False
-
-    # Zum Schluss die Bedingung mit GENAU DEM OPERATOR durchsetzen, mit dem
-    # sie hinterher auch geprueft wird. Die Erosionen sind im Kontinuum
-    # exakt, auf dem Gitter aber auf ganze Zellen gerundet -- und Rundung in
-    # zwei Schritten deckt sich nicht immer mit Rundung in einem. Der Rest
-    # ist klein; entscheidend ist, dass "erzeugt" und "geprueft" dieselbe
-    # Rechnung benutzen. Die Klinge hat Vorrang: sie ist das Produkt.
-    slack = ejector & (dilate_xy(blade, travel, grid)
-                       | dilate_3d(blade, cfg.print_clearance_mm, grid))
-    ejector &= ~slack
-    return blade, ejector, {"discretisation_slack_voxels": int(slack.sum()),
-                            "blade_erosion_mm": [round(float(x), 2) for x in
-                                                 np.unique(e_blade)],
-                            "ejector_erosion_mm": [round(float(x), 2) for x in
-                                                   np.unique(e_ej)],
-                            "cavity_depth_mm": travel}
+    return blade, ejector, {
+        "continuity_voxels_added": continuity["added"],
+        "blade_shaved_voxels": int(shave.sum()),
+        "support_pillar_voxels": int(pillars.sum()),
+        "ejector_clearance_mm": round(clearance, 2),
+        "blade_shave_mm": round(shave_mm, 2),
+        "pocket_depth_mm": cfg.cut_depth_mm,
+        "protect": protect,
+        "structure": continuity["columns"] | pillars,
+        "blade2d": blade2d,
+    }
 
 
 def build_state_field(blade_mask2d: np.ndarray, grid: CylGrid,
@@ -1818,7 +1977,7 @@ def build_state_field(blade_mask2d: np.ndarray, grid: CylGrid,
     zone3d = np.zeros(grid.shape, dtype=bool)
     zone3d[:, :, gyro_ring] = True
     report["gyroid_zone_mm"] = (round(float(hub_r), 2), round(float(r_gyro_max), 2))
-    if r_gyro_max - hub_r < 2 * cfg.min_wall_mm + cfg.travel_mm:
+    if r_gyro_max - hub_r < 2 * cfg.min_wall_mm + cfg.clearance_mm():
         warnings.append(
             f"Zwischen Nabe ({hub_r:.1f} mm) und Schneidentiefe "
             f"({r_gyro_max:.1f} mm) bleiben nur {r_gyro_max - hub_r:.1f} mm fuer "
@@ -1828,8 +1987,8 @@ def build_state_field(blade_mask2d: np.ndarray, grid: CylGrid,
 
     # -- Gyroid anpassen (auf grobem Gitter) -------------------------------
     anchor_blade = project_45(blade2d, grid, 0.0, solid_depth)
-    anchor_plate = project_45(~blade2d, grid, cfg.travel_mm, solid_depth)
-    fit_voxel = max(grid.voxel_mm, cfg.travel_mm / 3.0)
+    anchor_plate = project_45(~blade2d, grid, cfg.clearance_mm(), solid_depth)
+    fit_voxel = max(grid.voxel_mm, cfg.clearance_mm() / 2.0)
     coarse = CylGrid.from_dimensions(grid.radius_mm, grid.height_mm, fit_voxel,
                                      cfg.max_voxels)
     if coarse.nt * coarse.nz * coarse.nr < grid.nt * grid.nz * grid.nr:
@@ -1846,22 +2005,35 @@ def build_state_field(blade_mask2d: np.ndarray, grid: CylGrid,
     else:
         # Untergrenze: eine Gyroid-Masche muss den beidseitig erodierten Hub
         # plus zwei Waende noch hergeben.
-        base = max(cfg.travel_mm + 2 * cfg.min_wall_mm, 1e-3)
-        periods = [round(f * base, 2) for f in (1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.5)]
+        # Fein anfangen: je feiner die Masche, desto mehr Anbindungspunkte
+        # findet das Muster in der Tiefe -- und desto weniger davon geht
+        # verloren. Groeber wird nur, was fuer Spalt und Zusammenhang noetig
+        # ist.
+        base = max(cfg.clearance_mm() + grid.voxel_mm / 2.0
+                   + 2 * cfg.min_wall_mm, 1e-3)
+        periods = [round(f * base, 2) for f in
+                   (1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0, 6.5)]
+        # Eine Masche, die so gross ist wie die Zone dick, kann sie nicht
+        # ausfuellen: das Netzwerk zerfaellt dann in Ringe. Anderthalb
+        # Maschen ueber die Dicke sind das Mindeste.
+        max_period = (r_gyro_max - hub_r) / 1.5
+        fitting = [p for p in periods if p <= max_period]
+        periods = fitting or periods[:1]
     z_stretches = ([float(cfg.gyroid_z_stretch)] if cfg.gyroid_z_stretch
                    else [8.0, 4.0, 2.0])
-    fit = fit_gyroid(fit_grid, zone_fit, cfg.travel_mm / 2.0, cfg.min_wall_mm,
+    # Mit derselben effektiven Spaltbreite anpassen, mit der spaeter gebaut
+    # wird -- inklusive der Voxelkante Reserve, die der Ausstoesser fuer die
+    # Nachbesserungen an der Klinge zusaetzlich Abstand haelt. Rechnet die
+    # Anpassung mit dem nominellen Spalt, waehlt sie eine Masche, in der der
+    # Ausstoesser anschliessend nicht mehr existiert (gemessen: 11053 statt
+    # 134815 mm3).
+    effective_gap = cfg.clearance_mm() + grid.voxel_mm / 2.0
+    fit = fit_gyroid(fit_grid, zone_fit, effective_gap, cfg.min_wall_mm,
                      periods, z_stretches, cfg.phase_candidates,
                      anchor_a_fit, anchor_b_fit)
 
     # -- Ein Feld, zwei Koerper -------------------------------------------
     blade, ejector, split = split_bodies(blade2d, grid, fit, cfg)
-
-    # Die Achsbohrung geht durch beide Koerper.
-    if cfg.axis_diameter_mm:
-        bore = r < cfg.axis_diameter_mm / 2.0
-        blade[:, :, bore] = False
-        ejector[:, :, bore] = False
 
     report["gyroid"] = {
         "period_mm": fit.period_mm,
@@ -1884,14 +2056,16 @@ def build_state_field(blade_mask2d: np.ndarray, grid: CylGrid,
 # ---------------------------------------------------------------------------
 
 def check_xy_travel(blade: np.ndarray, ejector: np.ndarray, grid: CylGrid,
-                    travel_mm: float) -> tuple[bool, int]:
-    """Die Kernbedingung: verschiebt man den Ausstoesser um ``travel_mm`` in
+                    clearance_mm: float) -> tuple[bool, int]:
+    """Die Kernbedingung: verschiebt man den Ausstoesser um ``clearance_mm``
+    (die halbe Hubstrecke -- er wandert aus seiner Mittellage nach beiden
+    Seiten) in
     IRGENDEINE Richtung der XY-Ebene, darf er die Schneide nicht beruehren.
 
     Gemessen als Dilatation, nicht gerechnet: die Radienbuchhaltung der
     Vorgaengerversion hat schon einmal "richtig aussehende" Formeln geliefert
     und trotzdem zwei sich durchdringende Koerper."""
-    hit = dilate_xy(ejector, travel_mm, grid) & blade
+    hit = dilate_xy(ejector, clearance_mm, grid) & blade
     return (not hit.any()), int(hit.sum())
 
 
@@ -1905,7 +2079,8 @@ def measure(blade: np.ndarray, ejector: np.ndarray, grid: CylGrid,
             cfg: CoexistenceConfig) -> dict:
     """Alle Randbedingungen am fertigen Voxelfeld nachmessen."""
     vol = grid.voxel_volume()
-    travel_ok, travel_hits = check_xy_travel(blade, ejector, grid, cfg.travel_mm)
+    travel_ok, travel_hits = check_xy_travel(blade, ejector, grid,
+                                            cfg.clearance_mm())
     print_ok = not (dilate_3d(ejector, cfg.print_clearance_mm, grid) & blade).any()
     return {
         "blade_bodies": count_components(blade),
@@ -1932,13 +2107,22 @@ def voxels_to_mesh(occ: np.ndarray, grid: CylGrid) -> trimesh.Trimesh:
     """Erzeugt die Oberflaeche der Voxelmenge direkt in Zylinderkoordinaten.
 
     Ausgegeben wird genau die Flaeche zwischen einem besetzten und einem
-    freien Voxel -- damit ist das Ergebnis geschlossen (jede Kante gehoert zu
-    genau zwei Dreiecken), solange keine reinen Kanten-/Eckkontakte
-    uebrigbleiben; dafuer sorgt ``resolve_diagonal_contacts``.
+    freien Voxel. Kein Marching Cubes: die Voxelgrenzen SIND die
+    Konstruktionsgrenzen, und jede Glaettung wuerde genau den Bewegungsspalt
+    anknabbern, der vorher muehsam eingehalten wurde.
 
-    Kein Marching Cubes: die Voxelgrenzen SIND die Konstruktionsgrenzen. Jede
-    Glaettung wuerde genau den Bewegungsspalt anknabbern, der vorher muehsam
-    eingehalten wurde.
+    Beruehren sich zwei Voxel nur ueber eine KANTE, waere diese Kante von
+    vier Dreiecken belegt und das Mesh damit nicht geschlossen. Statt dafuer
+    Material zu opfern, wird die geteilte Ecke AUFGESPALTEN: jede
+    flaechenzusammenhaengende Gruppe von Voxeln um diese Ecke bekommt ihre
+    eigene Kopie des Eckpunkts. Die Geometrie bleibt dabei exakt dieselbe --
+    es aendert sich nur, welche Dreiecke sich einen Index teilen -- und jede
+    Kante gehoert wieder zu genau zwei Dreiecken.
+
+    Das ist der richtige Ort dafuer. Solche Kontakte im Voxelfeld aufzuloesen
+    hiesse, entweder eine Zelle zu setzen (wo oft kein Platz ist) oder eine
+    wegzunehmen (wo womoeglich Muster steht); beides bezahlt eine reine
+    Darstellungsfrage mit dem Bauteil.
     """
     nt, nz, nr = grid.shape
     if not occ.any():
@@ -1950,6 +2134,7 @@ def voxels_to_mesh(occ: np.ndarray, grid: CylGrid) -> trimesh.Trimesh:
         return ((i % nt) * nvz + j) * nvr + k
 
     quads: list[np.ndarray] = []
+    owners: list[np.ndarray] = []
 
     def emit(cells, corners):
         """corners: Liste von (di, dj, dk) im Gegenuhrzeigersinn von aussen."""
@@ -1958,6 +2143,7 @@ def voxels_to_mesh(occ: np.ndarray, grid: CylGrid) -> trimesh.Trimesh:
         i, j, k = cells
         quads.append(np.stack([vid(i + di, j + dj, k + dk)
                                for di, dj, dk in corners], axis=1))
+        owners.append(np.stack([i, j, k], axis=1))
 
     # +r / -r (Mantelflaechen)
     outer = occ & ~np.pad(occ[:, :, 1:], ((0, 0), (0, 0), (0, 1)))
@@ -1980,21 +2166,128 @@ def voxels_to_mesh(occ: np.ndarray, grid: CylGrid) -> trimesh.Trimesh:
     if not quads:
         return trimesh.Trimesh()
     quad = np.concatenate(quads, axis=0)
-    faces = np.concatenate([quad[:, [0, 1, 2]], quad[:, [0, 2, 3]]], axis=0)
+    owner = np.concatenate(owners, axis=0)
+    quad, owner = _split_shared_corners(quad, owner, occ, grid, nvz, nvr)
 
+    faces = np.concatenate([quad[:, [0, 1, 2]], quad[:, [0, 2, 3]]], axis=0)
     used, faces_compact = np.unique(faces, return_inverse=True)
     faces_compact = faces_compact.reshape(faces.shape).astype(np.int64)
-    kk = used % nvr
-    jj = (used // nvr) % nvz
-    ii = used // (nvr * nvz)
+    verts = _vertex_positions(used, grid, nvz, nvr)
+
+    # KEIN merge_vertices: die Eckpunkte sind hier bereits bewusst vergeben,
+    # und Zusammenfassen nach POSITION wuerde die aufgespaltenen Ecken sofort
+    # wieder verschmelzen -- der Kantenkontakt waere zurueck.
+    return trimesh.Trimesh(vertices=verts, faces=faces_compact, process=False)
+
+
+def _vertex_positions(ids: np.ndarray, grid: CylGrid, nvz: int, nvr: int
+                      ) -> np.ndarray:
+    """Rechnet Eckpunkt-Indizes in Koordinaten zurueck. Indizes oberhalb des
+    regulaeren Gitters sind Kopien (siehe ``_split_shared_corners``) und
+    zeigen per Modulo auf dieselbe Stelle."""
+    base = grid.nt * nvz * nvr
+    real = ids % base
+    kk = real % nvr
+    jj = (real // nvr) % nvz
+    ii = real // (nvr * nvz)
     th = ii * grid.dtheta
     rr = kk * grid.dr
-    verts = np.stack([rr * np.cos(th), rr * np.sin(th), jj * grid.dz], axis=1)
+    return np.stack([rr * np.cos(th), rr * np.sin(th), jj * grid.dz], axis=1)
 
-    mesh = trimesh.Trimesh(vertices=verts, faces=faces_compact, process=False)
-    mesh.merge_vertices()
-    mesh.remove_unreferenced_vertices()
-    return mesh
+
+def _split_shared_corners(quad: np.ndarray, owner: np.ndarray,
+                          occ: np.ndarray, grid: CylGrid, nvz: int, nvr: int
+                          ) -> tuple[np.ndarray, np.ndarray]:
+    """Eckpunkte aufspalten, an denen sich zwei nur ueber eine Kante
+    verbundene Voxelgruppen treffen.
+
+    Betroffen sind wenige Dutzend Ecken; deshalb wird nur um diese herum
+    gerechnet: die acht Voxel um die Ecke werden nach FLAECHENkontakt in
+    Gruppen zerlegt, und jede Gruppe ausser der ersten bekommt eine eigene
+    Kopie des Eckpunkts.
+    """
+    nt, nz, nr = occ.shape
+    base = nt * nvz * nvr
+    bad = _corners_of_edge_contacts(occ, nvz, nvr)
+    if not bad:
+        return quad, owner
+
+    next_id = base
+    for corner in bad:
+        i0, j0, k0 = corner
+        block = []                       # Voxel, die diese Ecke beruehren
+        for di in (-1, 0):
+            for dj in (-1, 0):
+                for dk in (-1, 0):
+                    t, z, r = (i0 + di) % nt, j0 + dj, k0 + dk
+                    if 0 <= z < nz and 0 <= r < nr and occ[t, z, r]:
+                        block.append((t, z, r))
+        if len(block) < 2:
+            continue
+        groups = _face_connected_groups(block, nt)
+        if len(groups) < 2:
+            continue
+        vertex = ((i0 % nt) * nvz + j0) * nvr + k0
+        for group in groups[1:]:
+            next_id += base
+            members = set(group)
+            hit = np.array([tuple(o) in members for o in owner])
+            if not hit.any():
+                continue
+            sel = np.where(hit[:, None] & (quad % base == vertex),
+                           next_id + vertex, quad)
+            quad = sel
+    return quad, owner
+
+
+def _corners_of_edge_contacts(occ: np.ndarray, nvz: int, nvr: int
+                              ) -> list[tuple[int, int, int]]:
+    """Die Eckpunkte, an denen ein reiner Kantenkontakt sitzt."""
+    corners: set[tuple[int, int, int]] = set()
+    nt, nz, nr = occ.shape
+    for axu, axv in ((0, 1), (0, 2), (1, 2)):
+        a = occ
+        b = _gather(occ, axu)
+        c = _gather(occ, axv)
+        d = _gather(b, axv)
+        for pattern in (a & d & ~b & ~c, b & c & ~a & ~d):
+            if not pattern.any():
+                continue
+            for t, z, r in np.argwhere(pattern):
+                # Die gemeinsame Kante liegt bei +1 in beiden Fensterachsen;
+                # ihre beiden Endpunkte unterscheiden sich in der dritten.
+                base_corner = [t, z, r]
+                base_corner[axu] += 1
+                base_corner[axv] += 1
+                third = ({0, 1, 2} - {axu, axv}).pop()
+                for step in (0, 1):
+                    cc = list(base_corner)
+                    cc[third] += step
+                    if 0 <= cc[1] < nvz and 0 <= cc[2] < nvr:
+                        corners.add((cc[0] % nt, cc[1], cc[2]))
+    return sorted(corners)
+
+
+def _face_connected_groups(voxels: list[tuple[int, int, int]], nt: int
+                           ) -> list[list[tuple[int, int, int]]]:
+    """Zerlegt eine Handvoll Voxel in Gruppen mit FLAECHENkontakt."""
+    remaining = set(voxels)
+    groups = []
+    while remaining:
+        seed = remaining.pop()
+        group = [seed]
+        frontier = [seed]
+        while frontier:
+            t, z, r = frontier.pop()
+            for dt, dz_, dr_ in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0),
+                                 (0, 0, 1), (0, 0, -1)):
+                nb = ((t + dt) % nt, z + dz_, r + dr_)
+                if nb in remaining:
+                    remaining.discard(nb)
+                    group.append(nb)
+                    frontier.append(nb)
+        groups.append(group)
+    return groups
 
 
 # ---------------------------------------------------------------------------
@@ -2023,36 +2316,50 @@ def build_gyroid_dual_cylinder(blade_mask2d: np.ndarray, radius_mm: float,
     if radius_mm < min_radius:
         raise ValueError(
             f"Radius {radius_mm:.1f} mm ist zu klein: Schneidentiefe "
-            f"({cfg.cut_depth_mm:.1f}) + Ueberblendung ({cfg.blend_mm:.1f}) + "
-            f"Gyroid-Zone ({2 * cfg.min_wall_mm + cfg.travel_mm:.1f}) + Abstand "
-            f"zur Nabe ({cfg.travel_mm + cfg.print_clearance_mm:.1f}) + Nabe "
-            f"({cfg.hub_radius():.1f}) brauchen mindestens "
+            f"({cfg.cut_depth_mm:.1f}) + Nabe ({cfg.hub_radius():.1f}) + eine "
+            f"Gyroid-Zone von vier Maschenmassen brauchen mindestens "
             f"{min_radius:.1f} mm. Radius vergroessern, Hub oder "
-            f"Schneidentiefe verkleinern oder eine duennere Achse waehlen."
+            f"Schneidentiefe verkleinern, duennere Achse waehlen -- oder ein "
+            f"feineres Voxelgitter, das macht die Masche kleiner."
         )
 
-    grid = CylGrid.from_dimensions(radius_mm, height_mm, cfg.voxel_mm,
+    # Die Voxelkante muss deutlich unter dem Spalt liegen. Sonst frisst die
+    # Diskretisierung den Spalt auf: der Ausstoesser haelt konservativ
+    # Flaeche-zu-Flaeche Abstand plus eine halbe Zelle, und wenn diese Zelle
+    # so gross ist wie der Spalt selbst, bleibt von seinen Kanaelen nichts
+    # uebrig. Gemessen am Wellenmuster: bei 1.6 mm Zellen und 1.5 mm Spalt
+    # kam der Ausstoesser in ZEHN Teilen heraus, bei 1.2 mm in einem.
+    voxel_mm = min(cfg.voxel_mm, 0.75 * cfg.clearance_mm())
+    grid = CylGrid.from_dimensions(radius_mm, height_mm, voxel_mm,
                                    cfg.max_voxels)
     blade, ejector, report = build_state_field(blade_mask2d, grid, cfg)
     warnings: list[str] = report.pop("warnings", [])
+    if voxel_mm < cfg.voxel_mm - 1e-9:
+        warnings.append(
+            f"Voxelgroesse auf {voxel_mm:.2f} mm verfeinert (gewaehlt "
+            f"{cfg.voxel_mm:.2f} mm): bei einem Spalt von "
+            f"{cfg.clearance_mm():.2f} mm braucht es mindestens diese "
+            f"Aufloesung, sonst zerfaellt der Ausstoesser."
+        )
+    report["voxel_mm_requested"] = cfg.voxel_mm
     report["grid"] = {"n_theta": grid.nt, "n_z": grid.nz, "n_r": grid.nr,
                       "voxel_mm": round(grid.voxel_mm, 3),
                       "voxels": int(grid.nt * grid.nz * grid.nr)}
     report["before_repair"] = measure(blade, ejector, grid, cfg)
 
     r = grid.r_centers()
-    bore = np.zeros(grid.shape, dtype=bool)
-    if cfg.axis_diameter_mm:
-        bore[:, :, r < cfg.axis_diameter_mm / 2.0] = True
-
     def allowed_for(other: np.ndarray) -> np.ndarray:
-        blocked = (dilate_xy(other, cfg.travel_mm, grid)
-                   | dilate_3d(other, cfg.print_clearance_mm, grid) | bore)
+        blocked = (dilate_xy(other, cfg.clearance_mm(), grid)
+                   | dilate_3d(other, cfg.print_clearance_mm, grid))
         return ~blocked
 
+    protect_blade = report["split"].pop("protect")
+    structure_blade = report["split"].pop("structure")
+    pattern2d = report["split"].pop("blade2d")
     depth = grid.depth_centers()
+    # Fuer den Ausstoesser gibt es im Aussenband nichts zu schuetzen: dort
+    # ist die Teigtasche, da steht ohnehin kein Material von ihm.
     protect = np.zeros(grid.shape, dtype=bool)
-    protect[:, :, depth < cfg.cut_depth_mm] = True
 
     repairs: dict = {}
     # Reihenfolge: erst der Ausstoesser (er bewegt sich und traegt die Nabe),
@@ -2060,9 +2367,76 @@ def build_gyroid_dual_cylinder(blade_mask2d: np.ndarray, radius_mm: float,
     # Reparatur die erste nicht wieder verletzen.
     ejector, repairs["ejector"] = repair_body(
         ejector, allowed_for(blade), protect, grid, cfg)
+    # Die Saeulen und Stuetzen unter dem Muster TRAGEN es, sind aber
+    # ersetzbar: darf eine Reparatur sie nicht anfassen, bleibt jeder
+    # Kantenkontakt, den sie verursachen, fuer immer stehen und das Mesh
+    # schliesst nicht mehr. Sie stehen deshalb im Satz fuer die Nachbesserung
+    # (dort werden sie wieder aufgebaut), nicht im Schutz.
     blade, repairs["blade"] = repair_body(
-        blade, allowed_for(ejector), protect, grid, cfg)
+        blade, allowed_for(ejector), protect_blade, grid, cfg,
+        restore=structure_blade)
     report["repairs"] = repairs
+
+    # -- Achsbohrung ganz zum Schluss -------------------------------------
+    # Waehrend der Optimierung ist die Nabe massiv. Das Loch spaeter
+    # herauszunehmen kostet nichts: es ist eine durchgehende Saeule um die
+    # Achse, kann also nichts abstuetzen und nichts verbinden, was nicht auch
+    # ohne sie zusammenhinge. Waehrend der Optimierung dagegen ist es nur ein
+    # zusaetzliches Hindernis fuer Stuetzen und Verbindungen -- und macht die
+    # Nabe unnoetig duenn.
+    if cfg.axis_diameter_mm:
+        bore = r < cfg.axis_diameter_mm / 2.0
+        report["axis_bore_voxels"] = int(blade[:, :, bore].sum()
+                                         + ejector[:, :, bore].sum())
+        blade[:, :, bore] = False
+        ejector[:, :, bore] = False
+        # Die Bohrung kann Material am Bohrungsrand die (diagonale) Auflage
+        # nehmen -- eine Zelle, die schraeg ueber einer Bohrungszelle stand,
+        # steht danach in der Luft. Also einmal nachstuetzen und aufraeumen;
+        # das ist ein kurzer Durchlauf, weil es nur um den Bohrungsrand geht.
+        blade, sup_b = repair_support(blade, allowed_for(ejector), grid,
+                                      cfg.max_overhang_deg,
+                                      protect=protect_blade)
+        ejector, sup_e = repair_support(ejector, allowed_for(blade), grid,
+                                        cfg.max_overhang_deg)
+        for name, sup in (("blade", sup_b), ("ejector", sup_e)):
+            sup.pop("trimmed_mask", None)
+            repairs[name]["support_voxels_added"] += sup["support_voxels_added"]
+            repairs[name]["floating_voxels_removed"] += sup["floating_voxels_removed"]
+
+    # Letzte Kantenkontakte: das Aufspalten der Ecken im Mesh loest sie fast
+    # alle, aber nicht die Faelle, in denen beide Seiten um die Ecke herum
+    # doch zusammenhaengen. Was dann noch uebrig ist, wird im Voxelfeld
+    # aufgeloest -- notfalls auch auf Kosten einer Musterzelle. Es geht um
+    # Einzelfaelle (gemessen 2 von 160000 Kanten), und die Zahl steht im
+    # Report: ein Kantenkontakt ist mechanisch eine Sollbruchstelle.
+    for occ_name in ("blade", "ejector"):
+        occ = blade if occ_name == "blade" else ejector
+        other = ejector if occ_name == "blade" else blade
+        if count_edge_contacts(occ) == 0:
+            continue
+        occ, info = resolve_diagonal_contacts(
+            occ, allowed_for(other), np.zeros(grid.shape, dtype=bool), grid,
+            cfg.max_overhang_deg)
+        occ, _ = trim_floating(occ, grid, cfg.max_overhang_deg)
+        repairs[occ_name]["diagonal_contacts_separated"] += info[
+            "diagonal_contacts_separated"]
+        if occ_name == "blade":
+            blade = occ
+        else:
+            ejector = occ
+
+    # Vollstaendigkeit des Musters, am FERTIGEN Koerper gemessen: welcher
+    # Anteil der Klingenpixel taucht im Aussenband wirklich auf? Das ist die
+    # Zahl, an der sich dieser Generator messen lassen muss -- das Muster IST
+    # das Produkt, und alles andere daran ist Mittel zum Zweck.
+    outer_band = depth < cfg.cut_depth_mm
+    present = blade[:, :, outer_band].any(axis=2)
+    missing = int((pattern2d & ~present).sum())
+    total = int(pattern2d.sum())
+    report["pattern_pixels"] = total
+    report["pattern_pixels_missing"] = missing
+    report["pattern_completeness"] = (1.0 - missing / total) if total else 1.0
 
     result = measure(blade, ejector, grid, cfg)
     report.update(result)
@@ -2070,11 +2444,20 @@ def build_gyroid_dual_cylinder(blade_mask2d: np.ndarray, radius_mm: float,
     # -- Bewertung: was ist nicht aufgegangen? -----------------------------
     if not result["xy_travel_ok"]:
         warnings.append(
-            f"Der Ausstoesser kann sich nicht ueberall um {cfg.travel_mm} mm in "
-            f"XY bewegen: {result['xy_travel_violations']} Voxel liegen zu dicht "
+            f"Der Ausstoesser kann sich nicht ueberall um "
+            f"+-{cfg.clearance_mm():.1f} mm (Hub {cfg.travel_mm:.1f} mm) in XY "
+            f"bewegen: {result['xy_travel_violations']} Voxel liegen zu dicht "
             f"an der Schneide."
         )
     lost_ok = True
+    if report["pattern_pixels_missing"]:
+        warnings.append(
+            f"{report['pattern_pixels_missing']} von "
+            f"{report['pattern_pixels']} Musterpixeln "
+            f"({100 * (1 - report['pattern_completeness']):.1f} %) fehlen im "
+            f"fertigen Koerper. Feineres Gitter, kleinerer Hub oder groesserer "
+            f"Radius schaffen dem Muster mehr Platz."
+        )
     for label, key in (("Schneide", "blade"), ("Ausstoesser", "ejector")):
         dropped = report["repairs"][key].get("pattern_fragments_dropped", 0)
         vol = report["repairs"][key].get("pattern_volume_dropped_mm3", 0.0)
@@ -2122,7 +2505,8 @@ def build_gyroid_dual_cylinder(blade_mask2d: np.ndarray, radius_mm: float,
     report["pattern_volume_dropped_mm3"] = sum(
         report["repairs"][k].get("pattern_volume_dropped_mm3", 0.0)
         for k in ("blade", "ejector"))
-    report["ok"] = (lost_ok and result["xy_travel_ok"] and result["print_clearance_ok"]
+    report["ok"] = (lost_ok and report["pattern_completeness"] >= 1.0
+                    and result["xy_travel_ok"] and result["print_clearance_ok"]
                     and result["blade_bodies"] == 1
                     and result["ejector_bodies"] == 1
                     and result["blade_floating_voxels"] == 0
