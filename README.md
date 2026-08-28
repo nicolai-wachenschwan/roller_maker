@@ -50,13 +50,52 @@ To run this application on your own machine, follow these steps:
 
 ## ⚙️ How it Works
 
-This tool works by mapping the pixels of an image onto the surface of a cylinder to create a 3D pattern.
+### Einzel-Zylinder (Lithophane-Roller)
 
 1.  **Image Processing:** The input image is converted to grayscale.
-2.  **Vertex Mapping:** The application iterates through each pixel of the image. The pixel's position is mapped to a 3D coordinate on a cylinder's surface, and its brightness determines the radial displacement (pattern depth). Brighter pixels create a deeper pattern, and darker pixels create a shallower one.
-3.  **Mesh Generation:** The `trimesh` library is used to create a 3D mesh from these vertices. It generates the main body of the roller and adds top and bottom caps to create a solid, watertight object.
-4.  **3D Preview:** The `stpyvista` library renders the `trimesh` object in the Streamlit interface, providing an interactive 3D view.
-5.  **STL Export:** The final `trimesh` object is exported to a binary STL format, which is a standard file type for 3D printing.
+2.  **Vertex Mapping:** The application iterates through each pixel of the image. The pixel's position is mapped to a 3D coordinate on a cylinder's surface, and its brightness determines the radial displacement (pattern depth).
+3.  **Mesh Generation:** The `trimesh` library is used to create a 3D mesh from these vertices.
+4.  **STL Export:** The final `trimesh` object is exported to a binary STL format.
+
+### Zweiteiler: Schneide + Ausstoesser (Voreinstellung)
+
+Der Roller wird als **zwei ineinander gedruckte Koerper** erzeugt
+(`gyroid_coexistence.py`): die dunklen Linien des Bildes werden zur
+**Schneide**, die hellen Flaechen dazwischen zum **Ausstoesser**, der das
+geschnittene Teil wieder herausdrueckt. Der Ausstoesser sitzt auf einer
+exzentrischen Achse; verschiebt man ihn in der XY-Ebene, druecken seine
+Platten auf der Seite nach aussen, die gerade aus dem Teig laeuft.
+
+Der Bauraum wird dafuer **voxelisiert**, statt jedem Koerper wie frueher ein
+Radiusfeld r(theta, z) zuzuordnen. Damit darf ein Ausstoesser-Bereich unter
+einer Klinge hindurchlaufen -- und ein vollstaendig eingeschlossenes Segment
+(Puzzleteil!) wird nicht mehr mit Stegen quer durch das Muster angebunden,
+sondern in der Tiefe.
+
+Zwei Prinzipien tragen den Aufbau:
+
+1.  **45deg-Projektion.** Jedes Musterpixel wird radial nach innen projiziert
+    und dabei um 45 Grad nach unten gekippt: ein Schritt nach innen ist ein
+    Schritt nach unten. Der Zylinder wird stehend gedruckt, und so sitzt
+    jedes Voxel auf dem Diagonalnachbarn darunter -- die Grenze, die FDM
+    ohne Stuetzmaterial schafft.
+2.  **Koexistenz durch ein Gyroid.** Tiefer im Bauteil zerlegt ein Gyroid
+    (dieselbe Struktur wie in Waermetauschern) den Raum in zwei ineinander
+    verschlungene, jeweils zusammenhaengende Netzwerke, die sich nirgends
+    beruehren. Dort verbinden sich die eingeschlossenen Platten
+    untereinander, ohne das Muster anzutasten.
+
+Beides wird in einem einzigen Skalarfeld zusammengefuehrt, dessen Vorzeichen
+den Bauraum teilt; der Bewegungsspalt entsteht anschliessend durch Erosion
+beider Haelften und ist damit exakt statt geschaetzt. Was danach noch offen
+ist -- schwebendes Material, lose Fragmente, Kantenkontakte -- wird repariert
+und **nachgemessen**: der Report nennt fuer jede Bedingung das Ergebnis
+(Anzahl Koerper, schwebende Voxel, eingehaltener Hub, Wandstaerke, verlorene
+Musterflaeche) statt sie nur zu behaupten.
+
+Die Vorgaengerlogik (`dual_cylinder_ejector.py`, Schale mit Loechern +
+Kern mit Stopfen, Verbindung ueber Stege in der Bildebene) liegt weiterhin im
+Repository, wird von der App aber nicht mehr benutzt.
 
 ## 💻 Technologies Used
 
@@ -70,3 +109,16 @@ This tool works by mapping the pixels of an image onto the surface of a cylinder
 - **Scipy:** For scientific computing, specifically for Delaunay triangulation.
 - **manifold3d:** For robust boolean operations.
 - **networkx:** For graph operations on the mesh.
+
+## ✅ Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q
+```
+
+`test_gyroid_coexistence.py` prueft die Voxel-Logik einzeln (Metrik des
+Bewegungsspalts, 45deg-Treppe, Stuetz- und Verbindungsreparatur, Mesh),
+`test_app.py` die ganze Kette ueber die Streamlit-Oberflaeche -- bewusst mit
+den **Voreinstellungen der App**, weil die Fehler dieses Generators an den
+physischen Massen haengen und nicht am Bildinhalt.
