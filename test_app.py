@@ -5,8 +5,17 @@ test_app.py
 Tests fuer app.py mit Streamlit's eigenem Testframework
 (streamlit.testing.v1.AppTest). Simuliert Nutzerinteraktion (Bild-Upload,
 Checkboxen, Button-Klick) ohne echten Browser und prueft, dass beide
-Erzeugungspfade -- Einzel-Zylinder und das neue Zwei-Teile-Auswerfer-System
-aus dual_cylinder_ejector.py -- fehlerfrei durchlaufen.
+Erzeugungspfade -- Einzel-Zylinder und der (nun voreingestellte) Zweiteiler
+aus Schneide und Ausstoesser (gyroid_coexistence.py) -- fehlerfrei
+durchlaufen.
+
+Die Tests laufen bewusst ueber die APP-VOREINSTELLUNGEN und nicht ueber
+handverlesene Parameter: Fehler dieses Generators haengen an den physischen
+Massen (Radius, Hoehe, Hub, Voxelgroesse), nicht am Bildinhalt, und genau
+die Standardkombination ist diejenige, die ein Benutzer als erstes trifft.
+Ein Bild mit dem Seitenverhaeltnis 1:1 ergibt bei Radius 30 mm eine
+Zylinderhoehe von 2*pi*30 = 188 mm -- der Fall, in dem frueher Fehler
+auftraten, die keiner der Tests bemerkt hat.
 
 Ausfuehren mit: pytest test_app.py -v
 """
@@ -20,6 +29,64 @@ from PIL import Image, ImageDraw
 from streamlit.testing.v1 import AppTest
 
 APP_TIMEOUT = 60
+# Der Zweiteiler rechnet auf einem Voxelgitter mit Millionen Zellen; das
+# dauert im Sekundenbereich statt im Millisekundenbereich.
+EJECTOR_TIMEOUT = 900
+
+
+def _set_coarse_voxels(at, voxel_mm: float = 1.2):
+    """Voxelgitter vergroebern, damit ein Test in Sekunden statt Minuten
+    laeuft. Die Voxelgroesse aendert die Physik nicht -- nur wie fein sie
+    abgetastet wird."""
+    at.slider(key="ejector_voxel_mm").set_value(voxel_mm)
+    return at
+
+
+def _square_image_bytes(size: int = 200) -> bytes:
+    """Quadratisches Puzzle-Raster. Bei Radius 30 mm wird daraus ein
+    Zylinder von 2*pi*30 = 188 mm Hoehe -- die Standardgeometrie der App."""
+    img = Image.new("L", (size, size), color=255)
+    draw = ImageDraw.Draw(img)
+    for y in range(0, size, 45):
+        draw.rectangle([0, y, size, y + 4], fill=0)
+    for x in range(0, size, 45):
+        draw.rectangle([x, 0, x + 4, size], fill=0)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _assert_two_sound_bodies(at, context: str):
+    """Alle harten Bedingungen an einem erzeugten Zweiteiler -- an einer
+    Stelle, damit jeder Test sie vollstaendig prueft und nicht nur die,
+    an die der Autor gerade gedacht hat."""
+    assert not at.exception, f"{context}: unerwartete Exception: {at.exception}"
+    blade = at.session_state["shell_mesh"]
+    ejector = at.session_state["core_mesh"]
+    report = at.session_state["ejector_report"]
+    assert blade is not None and not blade.is_empty, context
+    assert ejector is not None and not ejector.is_empty, context
+    assert report is not None, context
+
+    assert blade.is_watertight, f"{context}: Schneide ist nicht geschlossen"
+    assert ejector.is_watertight, f"{context}: Ausstoesser ist nicht geschlossen"
+    assert report["blade_bodies"] == 1, (
+        f"{context}: Schneide besteht aus {report['blade_bodies']} Teilen")
+    assert report["ejector_bodies"] == 1, (
+        f"{context}: Ausstoesser besteht aus {report['ejector_bodies']} Teilen")
+    assert report["blade_floating_voxels"] == 0, (
+        f"{context}: {report['blade_floating_voxels']} Voxel der Schneide "
+        f"haengen in der Luft")
+    assert report["ejector_floating_voxels"] == 0, (
+        f"{context}: {report['ejector_floating_voxels']} Voxel des "
+        f"Ausstoessers haengen in der Luft")
+    assert report["blade_on_build_plate"] and report["ejector_on_build_plate"], (
+        f"{context}: nicht beide Koerper stehen auf der Druckplatte")
+    assert report["xy_travel_ok"], (
+        f"{context}: der Ausstoesser kann sich nicht ueberall um den vollen "
+        f"Hub bewegen ({report['xy_travel_violations']} Voxel zu dicht)")
+    assert report["print_clearance_ok"], f"{context}: Druckspiel verletzt"
+    return blade, ejector, report
 
 # Das tatsaechliche Bild aus dem Bugreport (nahtlos kachelbares
 # Puzzleteil-Muster): "wenn ich dieses Bild ... verwende, zeigen die
@@ -158,38 +225,116 @@ def test_single_mesh_generation():
 
 
 def test_ejector_system_generation():
-    """Der neue Zwei-Teile-Pfad muss Schale+Kern erzeugen, ohne Fehler, und
-    das Overlap-freie Ergebnis (siehe dual_cylinder_ejector.py) muss auch
-    ueber die UI ankommen."""
+    """Der Zweiteiler ist die Voreinstellung und muss ohne jedes Zutun
+    durchlaufen: Bild hochladen, Knopf druecken, fertig."""
+    at = AppTest.from_file("app.py")
+    at.run(timeout=APP_TIMEOUT)
+    at = _run_with_uploaded_image(at)
+    assert not at.exception
+    assert at.checkbox(key="generate_ejector_system").value is True, (
+        "Der Zweiteiler soll die Voreinstellung sein"
+    )
+
+    _set_coarse_voxels(at)
+    at.run(timeout=APP_TIMEOUT)
+    at.button(key="generate_button").click()
+    at.run(timeout=EJECTOR_TIMEOUT)
+
+    _assert_two_sound_bodies(at, "Standardpfad")
+    assert at.session_state["mesh"] is None
+
+
+def test_ejector_parts_really_do_not_touch():
+    """Die zentrale Bedingung, unabhaengig vom Report nachgerechnet: die
+    beiden Meshes duerfen sich nicht durchdringen, und der Ausstoesser muss
+    sich um den vollen Hub verschieben lassen, ohne die Schneide zu
+    beruehren.
+
+    Geprueft wird das hier nicht am Voxelfeld (das tut der Generator
+    selbst), sondern an den EXPORTIERTEN Koerpern -- also an dem, was
+    tatsaechlich im Slicer landet."""
+    at = AppTest.from_file("app.py")
+    at.run(timeout=APP_TIMEOUT)
+    at = _run_with_uploaded_image(at)
+    _set_coarse_voxels(at)
+    at.run(timeout=APP_TIMEOUT)
+    at.button(key="generate_button").click()
+    at.run(timeout=EJECTOR_TIMEOUT)
+
+    blade, ejector, report = _assert_two_sound_bodies(at, "Kollisionspruefung")
+
+    overlap = blade.intersection(ejector, engine="manifold")
+    assert overlap.is_empty or abs(overlap.volume) < 1e-6, (
+        f"Schneide und Ausstoesser durchdringen sich um "
+        f"{abs(overlap.volume):.3f} mm3"
+    )
+
+    # Auslenkung in acht Richtungen der XY-Ebene. Gefordert ist die HALBE
+    # Hubstrecke: der Ausstoesser sitzt exzentrisch und wandert aus seiner
+    # Mittellage um +-travel/2.
+    travel = at.slider(key="ejector_travel").value / 2.0
+    for angle in np.linspace(0, 2 * np.pi, 8, endpoint=False):
+        moved = ejector.copy()
+        moved.apply_translation(
+            [travel * np.cos(angle), travel * np.sin(angle), 0.0]
+        )
+        hit = blade.intersection(moved, engine="manifold")
+        volume = 0.0 if hit.is_empty else abs(hit.volume)
+        # Eine Voxelecke Ueberschneidung ist Diskretisierung, kein Klemmen;
+        # gemessen wird gegen das Volumen der Koerper.
+        assert volume < 0.002 * abs(ejector.volume), (
+            f"Bei Auslenkung um {travel} mm in Richtung "
+            f"{np.degrees(angle):.0f} Grad klemmt der Ausstoesser "
+            f"({volume:.1f} mm3 Ueberschneidung)"
+        )
+
+
+def test_radius_slider_locks_out_cylinders_that_are_too_small():
+    """Zu kleine Zylinder werden gesperrt: unterhalb der Untergrenze bleibt
+    zwischen Nabe und Schneidentiefe zu wenig Platz fuer die Gyroid-Zone, und
+    der Ausstoesser kaeme in mehreren Teilen heraus.
+
+    Gesperrt wird ueber den Knopf, nicht ueber das Minimum des Reglers:
+    aendert man das Minimum eines Reglers mit Key, setzt Streamlit dessen
+    WERT auf eben dieses Minimum -- der Radius waere dann bei jeder
+    Aenderung an Hub oder Achse unbemerkt gesprungen (im Test von 30 auf
+    28.5 mm)."""
     at = AppTest.from_file("app.py")
     at.run(timeout=APP_TIMEOUT)
     at = _run_with_uploaded_image(at)
     assert not at.exception
 
-    at.checkbox(key="create_axis_hole").set_value(True)
-    at.checkbox(key="generate_ejector_system").set_value(True)
+    from gyroid_coexistence import CoexistenceConfig
+
+    # Radius unter die Untergrenze ziehen -> gesperrt.
+    too_small = CoexistenceConfig().min_radius_mm() - 2.0
+    at.slider(key="radius").set_value(round(too_small * 2) / 2)
     at.run(timeout=APP_TIMEOUT)
     assert not at.exception
-
-    at.button(key="generate_button").click()
-    at.run(timeout=APP_TIMEOUT)
-
-    assert not at.exception, f"Unerwartete Exception: {at.exception}"
-    assert at.session_state["mesh"] is None
-
-    shell_mesh = at.session_state["shell_mesh"]
-    core_mesh = at.session_state["core_mesh"]
-    assert shell_mesh is not None and not shell_mesh.is_empty
-    assert core_mesh is not None and not core_mesh.is_empty
-
-    report = at.session_state["ejector_report"]
-    assert report is not None
-    assert report["overlap_free"] is True, (
-        f"Schale und Kern ueberlappen ueber die App-UI: "
-        f"{report['overlap_volume_mm3']} mm3"
+    assert at.button(key="generate_button").disabled is True, (
+        "Ein zu kleiner Zylinder muss gesperrt sein"
     )
-    assert report["remaining_islands"] == 0
-    assert report["remaining_severing_rings"] == []
+    assert any("zu klein" in e.value for e in at.error), (
+        "Die Sperre muss auch begruendet werden"
+    )
+
+    # Kleinerer Hub und geringere Schneidentiefe -> derselbe Radius geht
+    # wieder: die Untergrenze folgt den Einstellungen.
+    at.slider(key="ejector_travel").set_value(1.0)
+    at.slider(key="ejector_cut_depth").set_value(2.0)
+    at.run(timeout=APP_TIMEOUT)
+    assert not at.exception
+    assert at.button(key="generate_button").disabled is False, (
+        "Mit kleinerem Hub muss derselbe Radius wieder erlaubt sein"
+    )
+
+    # Ohne Zweiteiler gilt die Beschraenkung gar nicht.
+    at.slider(key="ejector_travel").set_value(3.0)
+    at.slider(key="ejector_cut_depth").set_value(4.0)
+    at.run(timeout=APP_TIMEOUT)
+    at.checkbox(key="generate_ejector_system").set_value(False)
+    at.run(timeout=APP_TIMEOUT)
+    assert at.button(key="generate_button").disabled is False
 
 
 def test_ejector_system_requires_axis_hole():
@@ -233,78 +378,80 @@ def test_single_mesh_watertight_for_seamless_tileable_image():
     )
 
 
-def test_ejector_system_watertight_and_overlap_free_for_seamless_tileable_image():
-    """Regressionstest fuer den gemeldeten Bug: bei einem nahtlos
-    kachelbaren Muster (Puzzleteil-artig) fuehrte eine nicht robuste
-    Endkappen-Triangulierung zu einer nicht-wasserdichten Schale/Kern und
-    damit zu einem NaN-Ueberlappungsvolumen statt einer echten Pruefung."""
+def test_ejector_system_watertight_for_seamless_tileable_image():
+    """Regressionstest aus dem urspruenglichen Bugreport: bei einem nahtlos
+    kachelbaren Muster (Puzzleteil-artig, mit Zacken ueber den Bildrand) kam
+    frueher ein nicht geschlossenes Mesh heraus und damit ein NaN als
+    Ueberlappungsvolumen statt einer echten Pruefung."""
     at = AppTest.from_file("app.py")
     at.run(timeout=APP_TIMEOUT)
     at = _run_with_uploaded_image(at, _seamless_tileable_test_image_bytes())
     assert not at.exception
 
-    at.checkbox(key="create_axis_hole").set_value(True)
-    at.checkbox(key="generate_ejector_system").set_value(True)
+    _set_coarse_voxels(at)
     at.run(timeout=APP_TIMEOUT)
-
     at.button(key="generate_button").click()
-    at.run(timeout=APP_TIMEOUT)
+    at.run(timeout=EJECTOR_TIMEOUT)
 
-    assert not at.exception, f"Unerwartete Exception: {at.exception}"
-    shell_mesh = at.session_state["shell_mesh"]
-    core_mesh = at.session_state["core_mesh"]
-    assert shell_mesh is not None and not shell_mesh.is_empty
-    assert core_mesh is not None and not core_mesh.is_empty
-    assert shell_mesh.is_watertight, "Schale ist beim Kachelmuster nicht wasserdicht"
-    assert core_mesh.is_watertight, "Kern ist beim Kachelmuster nicht wasserdicht"
-
-    report = at.session_state["ejector_report"]
-    assert report is not None
-    assert not np.isnan(report["overlap_volume_mm3"]), (
-        "Ueberlappungsvolumen ist NaN -- genau der urspruenglich gemeldete Fehlerfall"
+    blade, ejector, report = _assert_two_sound_bodies(at, "Kachelmuster")
+    overlap = blade.intersection(ejector, engine="manifold")
+    volume = 0.0 if overlap.is_empty else abs(overlap.volume)
+    assert not np.isnan(volume), (
+        "Ueberlappungsvolumen ist NaN -- genau der urspruenglich gemeldete "
+        "Fehlerfall"
     )
-    assert report["overlap_free"] is True, (
-        f"Schale und Kern ueberlappen ueber die App-UI: "
-        f"{report['overlap_volume_mm3']} mm3"
-    )
+    assert volume < 1e-6, f"Koerper durchdringen sich um {volume} mm3"
 
 
 def test_ejector_system_with_original_bugreport_image():
-    """Der wichtigste Regressionstest: das TATSAECHLICHE Bild aus dem
-    Bugreport (test_assets/puzzle_pattern_bugreport.png), einmal komplett
-    ueber die echte App-UI hochgeladen und mit dem Zwei-Teile-Auswerfer
-    erzeugt. Muss watertight sein und darf kein NaN-Ueberlappungsvolumen
-    liefern."""
+    """Das TATSAECHLICHE Bild aus dem Bugreport, komplett ueber die echte
+    App-UI und mit den VOREINSTELLUNGEN der App erzeugt.
+
+    Es ist der harte Fall: die Schnittlinien bilden lauter geschlossene
+    Puzzlezellen, jede Ausstoesserplatte ist damit ringsum von Klinge
+    umgeben. Ohne die Gyroid-Struktur in der Tiefe koennte keine dieser
+    Platten mit den anderen verbunden werden, ohne das Muster zu
+    zerschneiden."""
     at = AppTest.from_file("app.py")
     at.run(timeout=APP_TIMEOUT)
     at = _run_with_uploaded_image(at, _puzzle_pattern_bugreport_image_bytes())
     assert not at.exception
 
-    at.checkbox(key="create_axis_hole").set_value(True)
-    at.checkbox(key="generate_ejector_system").set_value(True)
+    _set_coarse_voxels(at)
     at.run(timeout=APP_TIMEOUT)
-
     at.button(key="generate_button").click()
+    at.run(timeout=EJECTOR_TIMEOUT)
+
+    _assert_two_sound_bodies(at, "Original-Bugreport-Bild")
+
+
+def test_ejector_system_at_app_defaults_for_square_image():
+    """Alles auf Voreinstellung, quadratisches Muster -- daraus wird bei
+    Radius 30 mm ein Zylinder von 188 mm Hoehe.
+
+    Diese Kombination ist mit Absicht getestet: Fehler dieses Generators
+    haengen an den physischen Massen und am Verhaeltnis von Hoehe zu Radius,
+    nicht am Bildinhalt. Beim schlanken, hohen Zylinder ist die
+    Gyroid-Zone nur noch etwa eine Maschenweite dick, und genau dort sind
+    frueher Fehler durchgerutscht, die mit handverlesenen Testparametern
+    unsichtbar blieben (etwa dr > dz, wodurch die 45deg-Treppe als
+    schwebend galt und das halbe Muster weggetrimmt wurde)."""
+    at = AppTest.from_file("app.py")
     at.run(timeout=APP_TIMEOUT)
+    at = _run_with_uploaded_image(at, _square_image_bytes())
+    assert not at.exception
 
-    assert not at.exception, f"Unerwartete Exception: {at.exception}"
-    shell_mesh = at.session_state["shell_mesh"]
-    core_mesh = at.session_state["core_mesh"]
-    assert shell_mesh is not None and not shell_mesh.is_empty
-    assert core_mesh is not None and not core_mesh.is_empty
-    assert shell_mesh.is_watertight, "Schale ist beim Original-Bugreport-Bild nicht wasserdicht"
-    assert core_mesh.is_watertight, "Kern ist beim Original-Bugreport-Bild nicht wasserdicht"
+    # Bewusst KEINE Vergroeberung: das hier ist der Standardfall.
+    at.button(key="generate_button").click()
+    at.run(timeout=EJECTOR_TIMEOUT)
 
-    report = at.session_state["ejector_report"]
-    assert report is not None
-    assert not np.isnan(report["overlap_volume_mm3"]), (
-        "Ueberlappungsvolumen ist NaN beim Original-Bugreport-Bild -- der "
-        "urspruenglich gemeldete Fehlerfall"
+    blade, ejector, report = _assert_two_sound_bodies(at, "App-Voreinstellung")
+    height = blade.bounds[1, 2] - blade.bounds[0, 2]
+    assert height == pytest.approx(2 * np.pi * 30.0, rel=0.02), (
+        f"Erwartet wurde die Standardgeometrie (Hoehe = Umfang = 188 mm), "
+        f"gemessen {height:.0f} mm"
     )
-    assert report["overlap_free"] is True, (
-        f"Schale und Kern ueberlappen beim Original-Bugreport-Bild: "
-        f"{report['overlap_volume_mm3']} mm3"
-    )
+    assert report["ok"], f"Report meldet Maengel: {report['warnings']}"
 
 
 def _puzzle_grid_image_bytes(ny: int = 240, nx: int = 180) -> bytes:
@@ -323,77 +470,72 @@ def _puzzle_grid_image_bytes(ny: int = 240, nx: int = 180) -> bytes:
 
 
 def test_ejector_system_connects_enclosed_puzzle_segments():
-    """Grenzfall aus dem Bugreport: bei einem Puzzle-artigen Muster sind die
-    Segmente vollstaendig eingeschlossen. Ueber die App-UI muss trotzdem eine
-    Schale herauskommen, die aus GENAU EINEM Koerper besteht (keine losen
-    Inseln), und die Verbindung muss mit minimal vielen Stegen passieren."""
+    """Der Kern des Konzepts: bei einem Puzzle-Raster ist JEDE
+    Ausstoesserflaeche vollstaendig von Klinge umschlossen. In der Bildebene
+    gibt es keine Verbindung zwischen ihnen -- sie kann nur in der Tiefe
+    entstehen, durch die Gyroid-Struktur.
+
+    Der Test prueft deshalb beides: dass das Muster wirklich aus lauter
+    eingeschlossenen Zellen besteht, und dass trotzdem genau ein
+    Ausstoesser-Koerper herauskommt."""
     at = AppTest.from_file("app.py")
     at.run(timeout=APP_TIMEOUT)
     at = _run_with_uploaded_image(at, _puzzle_grid_image_bytes())
     assert not at.exception
 
-    at.checkbox(key="create_axis_hole").set_value(True)
-    at.checkbox(key="generate_ejector_system").set_value(True)
+    _set_coarse_voxels(at)
     at.run(timeout=APP_TIMEOUT)
-
     at.button(key="generate_button").click()
-    at.run(timeout=APP_TIMEOUT)
+    at.run(timeout=EJECTOR_TIMEOUT)
 
-    assert not at.exception, f"Unerwartete Exception: {at.exception}"
-    report = at.session_state["ejector_report"]
-    assert report is not None
-    assert report["components_found"] > 1, (
-        "Testmuster sollte eingeschlossene Segmente enthalten"
+    blade, ejector, report = _assert_two_sound_bodies(at, "Puzzle-Raster")
+
+    # Gegenprobe, dass das Testmuster wirklich der schwere Fall ist: in der
+    # BILDEBENE zerfaellt die Ausstoesserflaeche in viele Zellen.
+    from gyroid_coexistence import image_to_blade_mask, label_periodic
+
+    plate2d = ~image_to_blade_mask(
+        np.array(Image.open(io.BytesIO(_puzzle_grid_image_bytes())).convert("L")),
+        128,
     )
-    assert report["single_body"], "Muster wurde nicht zu einem Koerper verbunden"
-    assert report["bridges_added"] <= report["components_found"] - 1
-    assert report["shell_bodies"] == 1, (
-        f"Schale zerfaellt in {report['shell_bodies']} lose Teile"
+    _, cells = label_periodic(plate2d[:, :, None])
+    assert cells > 4, (
+        f"Testmuster sollte viele eingeschlossene Zellen haben, hat aber {cells}"
     )
-    assert report["core_bodies"] == 1
-    assert report["overlap_free"] is True, report["overlap_volume_mm3"]
 
 
 def test_ejector_parts_are_durable_not_hollow():
-    """Zweiter gemeldeter Fehler: 'beide Zylinder hohl -> geringe
-    Haltbarkeit'. Ueber die App-UI nachgerechnet: die Schale muss die
-    eingestellte Wandstaerke wirklich haben (Volumen ~ Kreisring abzueglich
-    Loecher) und der Kern muss massiv sein."""
+    """Zweiter gemeldeter Fehler der Vorgaengerversion: 'beide Zylinder hohl
+    -> geringe Haltbarkeit'. Nachgerechnet wird deshalb, dass beide Koerper
+    einen nennenswerten Teil des Bauraums fuellen und dass ihr Material
+    ueberwiegend dicker ist als die eingestellte Mindestwandstaerke."""
     at = AppTest.from_file("app.py")
     at.run(timeout=APP_TIMEOUT)
     at = _run_with_uploaded_image(at)
-    assert not at.exception
-
-    at.checkbox(key="create_axis_hole").set_value(True)
-    at.checkbox(key="generate_ejector_system").set_value(True)
+    _set_coarse_voxels(at)
     at.run(timeout=APP_TIMEOUT)
-    at.slider(key="ejector_wall_thickness").set_value(2.0)
-    at.run(timeout=APP_TIMEOUT)
-
     at.button(key="generate_button").click()
-    at.run(timeout=APP_TIMEOUT)
+    at.run(timeout=EJECTOR_TIMEOUT)
 
-    assert not at.exception, f"Unerwartete Exception: {at.exception}"
-    report = at.session_state["ejector_report"]
-    shell_mesh = at.session_state["shell_mesh"]
-    core_mesh = at.session_state["core_mesh"]
+    blade, ejector, report = _assert_two_sound_bodies(at, "Haltbarkeit")
 
-    assert report["shell_wall_thickness_mm"] == pytest.approx(2.0)
-    radii = report["radii_mm"]
-    height = shell_mesh.bounds[1, 2] - shell_mesh.bounds[0, 2]
-    nominal_ring = np.pi * (radii["shell_outer"] ** 2 - radii["shell_inner"] ** 2) * height
-    # Selbst wenn die Haelfte des Musters Loch ist, darf die Wand nicht auf
-    # eine duenne Haut zusammenschrumpfen.
-    assert shell_mesh.volume > 0.3 * nominal_ring, (
-        f"Schale hat nur {shell_mesh.volume:.0f} mm3 von maximal "
-        f"{nominal_ring:.0f} mm3 -- die Wand ist zu einer Haut geschrumpft"
+    height = blade.bounds[1, 2] - blade.bounds[0, 2]
+    nominal = np.pi * 30.0 ** 2 * height
+    together = report["blade_volume_mm3"] + report["ejector_volume_mm3"]
+    assert together > 0.15 * nominal, (
+        f"Beide Koerper zusammen fuellen nur {together / nominal * 100:.0f} % "
+        f"des Zylinders -- das ist eher Gitter als Bauteil"
     )
-    assert report["core_fill_ratio"] > 0.95, (
-        f"Kern ist hohl (Fuellgrad {report['core_fill_ratio']:.2f})"
+    assert report["blade_volume_mm3"] > 0.02 * nominal, (
+        "Die Schneide ist zu einer Haut zusammengeschrumpft"
     )
-    assert core_mesh.volume > 0.95 * np.pi * (
-        radii["core_outer"] ** 2 - radii["axis"] ** 2
-    ) * height
+    assert report["ejector_volume_mm3"] > 0.05 * nominal, (
+        "Der Ausstoesser ist zu duenn, um etwas herauszudruecken"
+    )
+    assert report["blade_wall_ratio"] > 0.2 and report["ejector_wall_ratio"] > 0.2, (
+        f"Zu viel duennes Material: Wandanteile "
+        f"{report['blade_wall_ratio']:.2f} / {report['ejector_wall_ratio']:.2f}"
+    )
 
 
 if __name__ == "__main__":

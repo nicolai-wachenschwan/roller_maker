@@ -12,7 +12,7 @@ von den hier getesteten Aenderungen.
 Da stpyvista ohnehin nur einen interaktiven iframe im Browser rendert (im
 headless AppTest-Lauf gibt es davon nichts zu pruefen), wird das Modul fuer
 die Tests durch einen No-Op-Stub ersetzt. Die eigentliche Geometrie-Logik
-(dual_cylinder_ejector.py, create_cylinder_mesh, ...) wird davon nicht
+(gyroid_coexistence.py, create_cylinder_mesh, ...) wird davon nicht
 beruehrt und lueckenlos getestet.
 """
 
