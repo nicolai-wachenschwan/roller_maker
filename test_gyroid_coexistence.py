@@ -342,11 +342,40 @@ def test_report_names_the_gyroid_it_chose(puzzle_result):
 # Entartete Eingaben
 # ---------------------------------------------------------------------------
 
-def test_geometry_that_does_not_fit_is_refused_not_silently_built():
-    cfg = CoexistenceConfig(voxel_mm=1.5, cut_depth_mm=4.0, travel_mm=3.0)
-    with pytest.raises(ValueError, match="passen nicht in den Radius"):
-        build_gyroid_dual_cylinder(_puzzle_mask(), radius_mm=8.0,
+def test_radius_below_the_minimum_is_refused_not_silently_built():
+    """Zu klein heisst hier: fuer die Gyroid-Zone bleibt weniger als eine
+    Masche uebrig, und die eingeschlossenen Musterflaechen finden in der
+    Tiefe keinen Weg mehr zueinander. Das laesst sich mit feineren Voxeln
+    nicht heilen -- es ist eine Frage des Platzes im Querschnitt. Also
+    abweisen, nicht hinterher melden."""
+    cfg = CoexistenceConfig(voxel_mm=1.5)
+    minimum = cfg.min_radius_mm()
+    assert minimum == pytest.approx(24.2, abs=0.05)
+
+    with pytest.raises(ValueError, match="zu klein"):
+        build_gyroid_dual_cylinder(_puzzle_mask(), radius_mm=minimum - 0.5,
                                    height_mm=40.0, cfg=cfg)
+
+
+def test_minimum_radius_follows_the_settings():
+    """Die Untergrenze ist keine feste Zahl, sondern folgt den
+    Einstellungen: wer den Hub halbiert oder eine duennere Achse waehlt,
+    darf auch einen kleineren Zylinder bauen."""
+    base = CoexistenceConfig().min_radius_mm()
+    assert CoexistenceConfig(travel_mm=1.5).min_radius_mm() < base
+    assert CoexistenceConfig(axis_diameter_mm=3.0).min_radius_mm() < base
+    assert CoexistenceConfig(cut_depth_mm=2.0).min_radius_mm() < base
+    assert CoexistenceConfig(travel_mm=6.0).min_radius_mm() > base
+
+    # Und was die Untergrenze gerade noch erlaubt, muss auch funktionieren.
+    cfg = CoexistenceConfig(voxel_mm=1.2, travel_mm=1.5, axis_diameter_mm=3.0,
+                            cut_depth_mm=3.0, blend_mm=4.0)
+    _, _, report = build_gyroid_dual_cylinder(
+        _puzzle_mask(60, 60, 16), radius_mm=cfg.min_radius_mm(),
+        height_mm=45.0, cfg=cfg, build_meshes=False)
+    assert report["blade_bodies"] == 1
+    assert report["ejector_bodies"] == 1
+    assert report["xy_travel_ok"]
 
 
 def test_degenerate_masks_are_reported():

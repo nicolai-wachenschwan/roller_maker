@@ -4,8 +4,8 @@ gyroid_coexistence.py
 
 Koexistenz von Schneide und Ausstoesser im selben Bauraum -- Voxel-Ansatz.
 
-Warum ein kompletter Rewrite gegenueber ``dual_cylinder_ejector.py``
---------------------------------------------------------------------
+Warum ein kompletter Rewrite
+-----------------------------
 Die Vorgaengerlogik beschrieb beide Teile als Radiusfeld r(theta, z): pro
 Winkel und Hoehe genau EIN Radius je Koerper. Damit ist die radiale Ordnung
 fest verdrahtet -- aussen immer Schale, innen immer Kern -- und die einzige
@@ -1521,6 +1521,31 @@ class CoexistenceConfig:
     #: None = doppelte Mindestwandstaerke.
     min_fragment_mm_value: float | None = None
 
+    def min_radius_mm(self) -> float:
+        """Kleinster Radius, bei dem der Aufbau ueberhaupt Platz hat.
+
+        Von aussen nach innen aufaddiert, jeder Posten unverzichtbar:
+
+            Schneidentiefe + Ueberblendstrecke   das Muster und sein Uebergang
+          + 2 * Mindestwandstaerke + Hub         eine Gyroid-Masche: zwei
+                                                 Waende und der Spalt dazwischen
+          + Hub + Druckspiel                     Abstand der Klinge zur Nabe
+          + Nabenradius                          Nabe samt Achsbohrung
+
+        Darunter bleibt fuer die Gyroid-Zone weniger als eine Masche uebrig.
+        Die Koerper kommen dann zwar immer noch heraus, aber die
+        eingeschlossenen Musterflaechen finden in der Tiefe keinen Weg mehr
+        zueinander: gemessen an einem Puzzlemuster mit Radius 20 mm mussten
+        633 mm3 Musterflaeche entfallen, weil sie ringsum vom Bewegungsspalt
+        eingeschlossen waren. Das ist keine Frage der Aufloesung, sondern des
+        Platzes -- deshalb wird es gesperrt statt hinterher gemeldet.
+        """
+        gyroid_zone = 2.0 * self.min_wall_mm + self.travel_mm
+        return (self.cut_depth_mm + self.blend_mm
+                + gyroid_zone
+                + self.travel_mm + self.print_clearance_mm
+                + self.hub_radius())
+
     def min_fragment_mm(self) -> float:
         if self.min_fragment_mm_value is not None:
             return float(self.min_fragment_mm_value)
@@ -1994,11 +2019,16 @@ def build_gyroid_dual_cylinder(blade_mask2d: np.ndarray, radius_mm: float,
     cfg = cfg or CoexistenceConfig()
     if blade_mask2d.ndim != 2 or min(blade_mask2d.shape) < 2:
         raise ValueError(f"Maske zu klein: {blade_mask2d.shape}")
-    solid_depth = cfg.cut_depth_mm + cfg.blend_mm
-    if solid_depth + cfg.travel_mm >= radius_mm:
+    min_radius = cfg.min_radius_mm()
+    if radius_mm < min_radius:
         raise ValueError(
-            f"Schneidentiefe + Ruecken + Hub ({solid_depth + cfg.travel_mm:.1f} mm) "
-            f"passen nicht in den Radius ({radius_mm:.1f} mm)."
+            f"Radius {radius_mm:.1f} mm ist zu klein: Schneidentiefe "
+            f"({cfg.cut_depth_mm:.1f}) + Ueberblendung ({cfg.blend_mm:.1f}) + "
+            f"Gyroid-Zone ({2 * cfg.min_wall_mm + cfg.travel_mm:.1f}) + Abstand "
+            f"zur Nabe ({cfg.travel_mm + cfg.print_clearance_mm:.1f}) + Nabe "
+            f"({cfg.hub_radius():.1f}) brauchen mindestens "
+            f"{min_radius:.1f} mm. Radius vergroessern, Hub oder "
+            f"Schneidentiefe verkleinern oder eine duennere Achse waehlen."
         )
 
     grid = CylGrid.from_dimensions(radius_mm, height_mm, cfg.voxel_mm,

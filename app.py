@@ -70,12 +70,43 @@ def add_to_history(new_image):
     st.session_state.edited_image = new_image
 
 # --- Callbacks for Radius/Width Sync ---
+def ejector_min_radius():
+    """Kleinster Radius, den der Zweiteiler mit den aktuellen Einstellungen
+    noch hergibt.
+
+    Die Rechnung steht in CoexistenceConfig.min_radius_mm(). Sie haengt an
+    Hub, Schneidentiefe, Ueberblendung und Achsdurchmesser -- deshalb wird
+    sie hier aus dem Session-State neu ausgewertet, sobald einer dieser
+    Werte sich aendert. Unterhalb davon bleibt fuer die Gyroid-Zone weniger
+    als eine Masche uebrig, und eingeschlossene Musterflaechen finden in der
+    Tiefe keinen Weg mehr zueinander. Das ist eine Frage des Platzes und
+    nicht der Aufloesung, laesst sich also auch mit feineren Voxeln nicht
+    heilen -- deshalb wird es gesperrt statt hinterher gemeldet.
+    """
+    if not st.session_state.get('generate_ejector_system', True):
+        return 10.0
+    axis = (st.session_state.get('axis_diameter', 6.0)
+            if st.session_state.get('create_axis_hole', True) else None)
+    cfg = CoexistenceConfig(
+        travel_mm=st.session_state.get('ejector_travel', 3.0),
+        cut_depth_mm=st.session_state.get('ejector_cut_depth', 4.0),
+        min_wall_mm=st.session_state.get('ejector_min_wall', 1.2),
+        print_clearance_mm=st.session_state.get('ejector_clearance', 0.4),
+        blend_mm=st.session_state.get('ejector_blend', 6.0),
+        axis_diameter_mm=axis,
+    )
+    # Auf halbe Millimeter aufrunden, damit der Wert zur Schrittweite des
+    # Reglers passt.
+    return float(np.ceil(cfg.min_radius_mm() * 2) / 2)
+
+
 def sync_radius_from_width():
-    """Callback to update radius when width changes."""
-    if st.session_state.edited_image is None:
-        st.session_state.radius = st.session_state.width / (2 * np.pi)
-    else:
-        st.session_state.radius = st.session_state.width / (2 * np.pi)*st.session_state.edited_image.size[1]/st.session_state.edited_image.size[0]    
+    """Setzt den Radius aus der eingegebenen Breite -- aber nie unter die
+    Untergrenze, die der Zweiteiler braucht."""
+    width = st.session_state.width
+    radius = width / (2 * np.pi)
+    st.session_state.radius = max(radius, ejector_min_radius())
+
 
 def correct_overhangs(image, angle_deg, radius, displacement, dpi, allow_upscaling,
                       l_to_r=True, r_to_l=True, t_to_b=True, b_to_t=True):
@@ -408,12 +439,25 @@ with st.sidebar:
         help="Enter the width to set the radius accordingly, respecting image aspect ratio"
     )
 
+    min_radius = ejector_min_radius()
+    if st.session_state.radius < min_radius:
+        # Der Regler wuerde sonst mit einem Wert ausserhalb seines Bereichs
+        # erzeugt. Anheben statt abweisen: der Benutzer hat den Radius nicht
+        # zu klein gewaehlt, sondern die Auswerfer-Einstellungen zu gross.
+        st.session_state.radius = min_radius
     st.slider(
         "Base Radius (in mm)",
-        10.0,
+        min_radius,
         100.0,
         key='radius',
-        step=0.5
+        step=0.5,
+        help=(f"Untergrenze {min_radius:.1f} mm: darunter passen "
+              f"Schneidentiefe, Ueberblendung, eine Gyroid-Masche, der "
+              f"Abstand zur Nabe und die Nabe selbst nicht mehr in den "
+              f"Querschnitt. Kleiner wird es nur mit kleinerem Hub, "
+              f"geringerer Schneidentiefe oder duennerer Achse."
+              if st.session_state.get('generate_ejector_system', True)
+              else "Grundradius des Zylinders.")
     )
     radius = st.session_state.radius
     displacement = st.slider("Radial Displacement (Wall Thickness in mm)", 0.5, 10.0, 2.0, 0.1)
@@ -428,6 +472,7 @@ with st.sidebar:
                                   key="create_axis_hole")
     if create_axis_hole:
         axis_diameter = st.slider("Axis Diameter (in mm)", 1.0, min(radius * 1.8, 50.0), 6.0, 0.5,
+                                 key="axis_diameter",
                                  help=f"Maximum: {min(radius * 1.8, 50.0):.1f}mm (90% of base radius)")
         if axis_diameter >= radius * 0.9:
             st.warning("⚠️ Axis very thick - may cause structural problems")

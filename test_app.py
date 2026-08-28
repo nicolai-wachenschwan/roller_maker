@@ -287,6 +287,38 @@ def test_ejector_parts_really_do_not_touch():
         )
 
 
+def test_radius_slider_locks_out_cylinders_that_are_too_small():
+    """Zu kleine Zylinder werden gar nicht erst angeboten: unterhalb der
+    Untergrenze bleibt fuer die Gyroid-Zone weniger als eine Masche uebrig.
+    Der Regler zieht seine Grenze aus denselben Einstellungen, mit denen
+    spaeter gerechnet wird -- wer den Hub verkleinert, darf auch kleiner
+    bauen."""
+    from gyroid_coexistence import CoexistenceConfig
+
+    at = AppTest.from_file("app.py")
+    at.run(timeout=APP_TIMEOUT)
+    at = _run_with_uploaded_image(at)
+    assert not at.exception
+
+    expected = CoexistenceConfig().min_radius_mm()
+    slider = at.slider(key="radius")
+    assert slider.min == pytest.approx(expected, abs=0.5), (
+        f"Untergrenze des Radius ist {slider.min}, erwartet ~{expected:.1f}"
+    )
+    assert slider.value >= slider.min
+
+    # Kleinerer Hub -> kleinere Untergrenze.
+    at.slider(key="ejector_travel").set_value(1.5)
+    at.run(timeout=APP_TIMEOUT)
+    assert not at.exception
+    assert at.slider(key="radius").min < expected
+
+    # Ohne Zweiteiler faellt die Beschraenkung ganz weg.
+    at.checkbox(key="generate_ejector_system").set_value(False)
+    at.run(timeout=APP_TIMEOUT)
+    assert at.slider(key="radius").min == pytest.approx(10.0)
+
+
 def test_ejector_system_requires_axis_hole():
     """Ohne Achsbohrung darf der Generate-Button fuer den Auswerfer-Pfad
     nicht aktiv sein (Validierung in der Sidebar)."""

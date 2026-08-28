@@ -93,9 +93,13 @@ und **nachgemessen**: der Report nennt fuer jede Bedingung das Ergebnis
 (Anzahl Koerper, schwebende Voxel, eingehaltener Hub, Wandstaerke, verlorene
 Musterflaeche) statt sie nur zu behaupten.
 
-Die Vorgaengerlogik (`dual_cylinder_ejector.py`, Schale mit Loechern +
-Kern mit Stopfen, Verbindung ueber Stege in der Bildebene) liegt weiterhin im
-Repository, wird von der App aber nicht mehr benutzt.
+Der Radius hat dabei eine **Untergrenze**, die sich aus den Einstellungen
+ergibt (Schneidentiefe + Ueberblendung + eine Gyroid-Masche + Abstand zur
+Nabe + Nabe selbst, mit den Voreinstellungen 24.5 mm). Darunter bleibt fuer
+die Gyroid-Zone weniger als eine Masche uebrig, und eingeschlossene
+Musterflaechen finden in der Tiefe keinen Weg mehr zueinander -- eine Frage
+des Platzes, die auch feinere Voxel nicht loesen. Der Regler laesst kleinere
+Werte deshalb gar nicht erst zu.
 
 ## 💻 Technologies Used
 
